@@ -6,6 +6,23 @@ on:
   pull_request:
     branches: ["main"]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag, for example v1.0.0. Leave empty to build artifact only."
+        required: false
+        type: string
+      release_title:
+        description: "Release title. Defaults to Komari SSH Proxy <tag>."
+        required: false
+        type: string
+      prerelease:
+        description: "Mark this release as a prerelease."
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
 
 jobs:
   check:
@@ -13,10 +30,10 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -31,13 +48,14 @@ jobs:
   build-windows:
     name: Build Windows EXE
     runs-on: windows-latest
+    needs: check
     if: github.event_name == 'workflow_dispatch'
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -50,8 +68,66 @@ jobs:
         run: python -m PyInstaller --noconfirm --clean KomariSSHProxy.spec
 
       - name: Upload executable artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: Komari-SSH-Proxy-windows
           path: dist/Komari SSH Proxy.exe
           if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    runs-on: windows-latest
+    needs: build-windows
+    if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+    permissions:
+      contents: write
+    steps:
+      - name: Download executable artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: Komari-SSH-Proxy-windows
+          path: release
+
+      - name: Write release notes
+        shell: pwsh
+        run: |
+          @"
+          Komari SSH Proxy 的自动构建版本。
+
+          - 支持将 Komari 面板 Web 终端反代为本地 SSH
+          - 支持多服务器、多端口同时代理
+          - 支持 PowerShell / curl 请求智能识别
+          - 支持深色、浅色、跟随系统主题
+          - 支持实时日志、日志等级、TXT 导出
+          - Windows EXE 由 GitHub Actions 构建
+          "@ | Out-File -FilePath release-notes.md -Encoding utf8
+
+      - name: Create release and upload executable
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_TITLE: ${{ inputs.release_title }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          $title = $env:RELEASE_TITLE
+          if ([string]::IsNullOrWhiteSpace($title)) {
+            $title = "Komari SSH Proxy $env:RELEASE_TAG"
+          }
+
+          $args = @(
+            "release", "create", $env:RELEASE_TAG,
+            "release/Komari SSH Proxy.exe",
+            "--repo", $env:GITHUB_REPOSITORY,
+            "--target", $env:GITHUB_SHA,
+            "--title", $title,
+            "--notes-file", "release-notes.md"
+          )
+
+          if ($env:PRERELEASE -eq "true") {
+            $args += "--prerelease"
+          } else {
+            $args += "--latest"
+          }
+
+          gh @args
