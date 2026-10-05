@@ -16,6 +16,7 @@ from config import APP_DISPLAY_NAME, AgentConfig, CONFIG_PATH
 from komari_client import KomariClient, KomariError, normalize_latest_status
 from request_parser import apply_parsed_request, describe_parsed, parse_request_text
 from ssh_bridge import LocalSSHProxyServer, ensure_config_host_key
+from ui_controls import AppCheckBox, AppLineEdit, AppPlainTextEdit, AppSpinBox, AppTextEdit
 
 
 LOG_VIEW_MAX_BLOCKS = 4000
@@ -146,210 +147,6 @@ class ClickableLabel(QtWidgets.QLabel):
             event.accept()
             return
         super().mouseReleaseEvent(event)
-
-
-CONTEXT_MENU_LABELS = {
-    "Undo": "撤销",
-    "Redo": "重做",
-    "Cut": "剪切",
-    "Copy": "复制",
-    "Paste": "粘贴",
-    "Delete": "删除",
-    "Select All": "全选",
-}
-
-
-def show_localized_context_menu(widget: QtWidgets.QWidget, event: QtGui.QContextMenuEvent) -> None:
-    menu_factory = getattr(widget, "createStandardContextMenu", None)
-    menu = menu_factory() if callable(menu_factory) else None
-    if menu is None:
-        line_edit_getter = getattr(widget, "lineEdit", None)
-        line_edit = line_edit_getter() if callable(line_edit_getter) else None
-        menu = line_edit.createStandardContextMenu() if line_edit is not None else QtWidgets.QMenu(widget)
-    localize_context_menu(menu)
-    menu.exec(event.globalPos())
-
-
-def localize_context_menu(menu: QtWidgets.QMenu) -> None:
-    for action in menu.actions():
-        raw = action.text().replace("&", "").split("\t", 1)[0].strip()
-        if raw in CONTEXT_MENU_LABELS:
-            action.setText(CONTEXT_MENU_LABELS[raw])
-
-
-class AppLineEdit(QtWidgets.QLineEdit):
-    def contextMenuEvent(self, event: QtGui.QContextMenuEvent) -> None:
-        show_localized_context_menu(self, event)
-
-
-class AppTextEdit(QtWidgets.QTextEdit):
-    def contextMenuEvent(self, event: QtGui.QContextMenuEvent) -> None:
-        show_localized_context_menu(self, event)
-
-
-class AppPlainTextEdit(QtWidgets.QPlainTextEdit):
-    def contextMenuEvent(self, event: QtGui.QContextMenuEvent) -> None:
-        show_localized_context_menu(self, event)
-
-
-class AppNumberSpinBox(QtWidgets.QSpinBox):
-    def __init__(self):
-        super().__init__()
-        self.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.DefaultContextMenu)
-        editor = self.lineEdit()
-        editor.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
-        editor.customContextMenuRequested.connect(
-            lambda pos, source=editor: self.show_editor_context_menu(source, pos)
-        )
-
-    def contextMenuEvent(self, event: QtGui.QContextMenuEvent) -> None:
-        show_localized_context_menu(self, event)
-
-    def show_editor_context_menu(self, source: QtWidgets.QLineEdit, pos: QtCore.QPoint) -> None:
-        menu = source.createStandardContextMenu()
-        localize_context_menu(menu)
-        menu.exec(source.mapToGlobal(pos))
-
-
-class AppCheckBox(QtWidgets.QCheckBox):
-    def __init__(self, text: str):
-        super().__init__(text)
-        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-
-    def sizeHint(self) -> QtCore.QSize:
-        metrics = self.fontMetrics()
-        return QtCore.QSize(metrics.horizontalAdvance(self.text()) + 34, 30)
-
-    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
-        painter = QtGui.QPainter(self)
-        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
-        app = QtWidgets.QApplication.instance()
-        dark = bool(app and app.property("effective_theme") == "dark")
-        field = QtGui.QColor("#0b0b0b" if dark else "#ffffff")
-        border = QtGui.QColor("#3a3a3a" if dark else "#c9d5cf")
-        accent = QtGui.QColor("#4fd1a5" if dark else "#18a579")
-        text = QtGui.QColor("#e8e8e8" if dark else "#14201b")
-
-        box_size = 18
-        box_y = (self.height() - box_size) // 2
-        box = QtCore.QRectF(0, box_y, box_size, box_size)
-        painter.setPen(QtGui.QPen(accent if self.isChecked() else border, 1.2))
-        painter.setBrush(accent if self.isChecked() else field)
-        painter.drawRoundedRect(box, 5, 5)
-
-        if self.isChecked():
-            pen = QtGui.QPen(QtGui.QColor("#ffffff"), 2.0)
-            pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
-            pen.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
-            painter.setPen(pen)
-            path = QtGui.QPainterPath()
-            path.moveTo(4.5, box_y + 9.5)
-            path.lineTo(8.0, box_y + 13.0)
-            path.lineTo(14.0, box_y + 5.5)
-            painter.drawPath(path)
-
-        painter.setPen(text)
-        text_rect = QtCore.QRect(28, 0, self.width() - 28, self.height())
-        painter.drawText(text_rect, QtCore.Qt.AlignmentFlag.AlignVCenter, self.text())
-
-
-class AppSpinBox(AppNumberSpinBox):
-    def __init__(self):
-        super().__init__()
-        self.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
-        self.setMouseTracking(True)
-        self._pressed_step = 0
-
-    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
-        super().paintEvent(event)
-        app = QtWidgets.QApplication.instance()
-        dark = bool(app and app.property("effective_theme") == "dark")
-        button = QtGui.QColor("#202020" if dark else "#eef4f1")
-        button_hover = QtGui.QColor("#2b2b2b" if dark else "#e0ebe5")
-        border = QtGui.QColor("#3a3a3a" if dark else "#c9d5cf")
-        arrow = QtGui.QColor("#d8d8d8" if dark else "#35433d")
-        hover_step = self._step_at(self.mapFromGlobal(QtGui.QCursor.pos()))
-
-        painter = QtGui.QPainter(self)
-        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
-        rail = self._rail_rect()
-        top = QtCore.QRectF(rail.left(), rail.top(), rail.width(), rail.height() / 2)
-        bottom = QtCore.QRectF(
-            rail.left(),
-            rail.top() + rail.height() / 2,
-            rail.width(),
-            rail.height() / 2,
-        )
-
-        painter.setPen(QtCore.Qt.PenStyle.NoPen)
-        painter.setBrush(button_hover if hover_step == 1 else button)
-        painter.drawRoundedRect(top.adjusted(0, 0, 0, 4), 7, 7)
-        painter.setBrush(button_hover if hover_step == -1 else button)
-        painter.drawRoundedRect(bottom.adjusted(0, -4, 0, 0), 7, 7)
-
-        painter.setPen(QtGui.QPen(border, 1))
-        middle_y = rail.top() + rail.height() / 2
-        painter.drawLine(QtCore.QPointF(rail.left(), middle_y), QtCore.QPointF(rail.right(), middle_y))
-        painter.drawLine(
-            QtCore.QPointF(rail.left(), rail.top() + 1),
-            QtCore.QPointF(rail.left(), rail.bottom() - 1),
-        )
-
-        painter.setPen(QtCore.Qt.PenStyle.NoPen)
-        painter.setBrush(arrow)
-        center_x = rail.center().x()
-        up_y = top.center().y()
-        down_y = bottom.center().y()
-
-        up = QtGui.QPolygonF(
-            [
-                QtCore.QPointF(center_x - 5, up_y + 3),
-                QtCore.QPointF(center_x + 5, up_y + 3),
-                QtCore.QPointF(center_x, up_y - 3),
-            ]
-        )
-        down = QtGui.QPolygonF(
-            [
-                QtCore.QPointF(center_x - 5, down_y - 3),
-                QtCore.QPointF(center_x + 5, down_y - 3),
-                QtCore.QPointF(center_x, down_y + 3),
-            ]
-        )
-        painter.drawPolygon(up)
-        painter.drawPolygon(down)
-
-    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
-        step = self._step_at(event.position().toPoint())
-        if event.button() == QtCore.Qt.MouseButton.LeftButton and step:
-            self._pressed_step = step
-            self.stepBy(step)
-            self.selectAll()
-            self.update()
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
-        self._pressed_step = 0
-        self.update()
-        super().mouseReleaseEvent(event)
-
-    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
-        self.update()
-        super().mouseMoveEvent(event)
-
-    def leaveEvent(self, event: QtCore.QEvent) -> None:
-        self.update()
-        super().leaveEvent(event)
-
-    def _rail_rect(self) -> QtCore.QRectF:
-        return QtCore.QRectF(self.width() - 25, 1, 24, self.height() - 2)
-
-    def _step_at(self, pos: QtCore.QPoint) -> int:
-        rail = self._rail_rect()
-        if not rail.contains(QtCore.QPointF(pos)):
-            return 0
-        return 1 if pos.y() < rail.center().y() else -1
 
 
 class ServerTableWidget(QtWidgets.QTableWidget):
@@ -687,6 +484,7 @@ class CredentialsPage(QtWidgets.QWidget):
 class ServerListPage(QtWidgets.QWidget):
     refresh_requested = QtCore.pyqtSignal()
     edit_credentials_requested = QtCore.pyqtSignal()
+    mcp_requested = QtCore.pyqtSignal()
     server_selected = QtCore.pyqtSignal(object)
 
     def __init__(self):
@@ -703,6 +501,8 @@ class ServerListPage(QtWidgets.QWidget):
         self.refresh_btn.clicked.connect(self.refresh_requested.emit)
         self.edit_btn = soft_button("凭据")
         self.edit_btn.clicked.connect(self.edit_credentials_requested.emit)
+        self.mcp_btn = soft_button("MCP")
+        self.mcp_btn.clicked.connect(self.mcp_requested.emit)
 
         self.table = ServerTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(["状态", "名称", "系统", "CPU", "内存", "流量", "IP"])
@@ -739,6 +539,7 @@ class ServerListPage(QtWidgets.QWidget):
         header = QtWidgets.QHBoxLayout()
         header.addWidget(title)
         header.addStretch(1)
+        header.addWidget(self.mcp_btn)
         header.addWidget(self.edit_btn)
         header.addWidget(self.refresh_btn)
 
@@ -870,16 +671,18 @@ class ProxyPage(QtWidgets.QWidget):
         self.public_access = AppCheckBox("允许公网访问")
         self.public_access.setChecked(False)
         self.two_fa_code = line_edit(config.terminal_2fa_code)
-        self.cols = AppNumberSpinBox()
-        self.cols.setObjectName("NoSpinButtons")
+        self.cols = AppSpinBox()
         self.cols.setRange(20, 400)
         self.cols.setValue(config.terminal_cols)
-        self.cols.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
-        self.rows = AppNumberSpinBox()
-        self.rows.setObjectName("NoSpinButtons")
+        self.rows = AppSpinBox()
         self.rows.setRange(8, 120)
         self.rows.setValue(config.terminal_rows)
-        self.rows.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.sticky = AppSpinBox()
+        self.sticky.setObjectName("StepperSpinBox")
+        self.sticky.setRange(0, 10080)
+        self.sticky.setSuffix(" 分钟")
+        self.sticky.setSpecialValueText("关闭粘性重连")
+        self.sticky.setValue(config.ssh_sticky_minutes)
         self.log_level_buttons = self._create_log_level_buttons()
 
         self._current_proxy_running = False
@@ -952,6 +755,7 @@ class ProxyPage(QtWidgets.QWidget):
         size_box.addWidget(self.rows)
         size_box.addWidget(QtWidgets.QLabel("行"))
         settings_layout.addRow("终端尺寸", size_box)
+        settings_layout.addRow("粘性重连", self.sticky)
         settings_layout.addRow("", self.public_access)
         settings_layout.addRow("", self.log_level_buttons)
         actions = QtWidgets.QHBoxLayout()
@@ -1006,6 +810,7 @@ class ProxyPage(QtWidgets.QWidget):
             QtCore.QSignalBlocker(self.two_fa_code),
             QtCore.QSignalBlocker(self.cols),
             QtCore.QSignalBlocker(self.rows),
+            QtCore.QSignalBlocker(self.sticky),
         ]
         self.port.setValue(config.ssh_port)
         self.username.setText(config.ssh_username)
@@ -1014,6 +819,7 @@ class ProxyPage(QtWidgets.QWidget):
         self.two_fa_code.setText(config.terminal_2fa_code)
         self.cols.setValue(config.terminal_cols)
         self.rows.setValue(config.terminal_rows)
+        self.sticky.setValue(config.ssh_sticky_minutes)
         del blockers
         self.log_lines.clear()
         self.log_view.clear()
@@ -1027,6 +833,7 @@ class ProxyPage(QtWidgets.QWidget):
         self.two_fa_code.textChanged.connect(self.settings_changed.emit)
         self.cols.valueChanged.connect(self.settings_changed.emit)
         self.rows.valueChanged.connect(self.settings_changed.emit)
+        self.sticky.valueChanged.connect(self.settings_changed.emit)
 
     def toggle_password_visible(self) -> None:
         visible = self.password_toggle.isChecked()
@@ -1164,6 +971,7 @@ class ProxyPage(QtWidgets.QWidget):
             "terminal_2fa_code": self.two_fa_code.text().strip(),
             "terminal_cols": int(self.cols.value()),
             "terminal_rows": int(self.rows.value()),
+            "ssh_sticky_minutes": int(self.sticky.value()),
         }
 
 
@@ -1284,13 +1092,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.selected_client: dict[str, Any] | None = None
         self.status_by_uuid: dict[str, dict[str, Any]] = {}
 
+        from mcp_server import McpRuntime
+        from mcp_ui import McpPage
+
+        self.mcp_runtime = McpRuntime(self.config, self.log_root / "mcp")
         self.stack = QtWidgets.QStackedWidget()
         self.credentials_page = CredentialsPage(self.config)
         self.server_page = ServerListPage()
         self.proxy_page = ProxyPage(self.config)
+        self.mcp_page = McpPage(self.mcp_runtime, self.config, self.save_mcp_config)
         self.stack.addWidget(self.credentials_page)
         self.stack.addWidget(self.server_page)
         self.stack.addWidget(self.proxy_page)
+        self.stack.addWidget(self.mcp_page)
 
         self.title_bar = TitleBar(self)
         shell = QtWidgets.QFrame()
@@ -1346,6 +1160,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.server_page.refresh_requested.connect(self.refresh_clients)
         self.server_page.edit_credentials_requested.connect(self.show_credentials)
         self.server_page.server_selected.connect(self.open_proxy_page)
+        self.server_page.mcp_requested.connect(self.open_mcp_page)
+        self.mcp_page.back_requested.connect(self.back_to_servers)
+        self.mcp_page.refresh_requested.connect(self.refresh_clients)
         self.proxy_page.back_requested.connect(self.back_to_servers)
         self.proxy_page.start_requested.connect(self.start_proxy)
         self.proxy_page.stop_requested.connect(self.stop_proxy)
@@ -1405,6 +1222,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_login_success(self, config: AgentConfig, payload: dict[str, Any]) -> None:
         self.config = config
+        self.mcp_runtime.update_config(config)
+        self.mcp_page.load_config(config)
         self.set_theme_mode(self.config.app_theme, persist=False)
         self.credentials_page.set_busy(False, "登录成功")
         self.stack.setCurrentWidget(self.server_page)
@@ -1434,8 +1253,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_clients_loaded(self, clients: list[dict[str, Any]], status: dict[str, dict[str, Any]]) -> None:
         self.status_by_uuid = status
+        self.mcp_runtime.manager.update_catalog(self.config, clients, status)
         self.server_page.active_proxies = self.active_proxy_summaries()
         self.server_page.set_clients(clients, status)
+
+    def save_mcp_config(self, config: AgentConfig) -> None:
+        config.save()
+        self.config = config
+        self.credentials_page.current_config = config
+
+    def open_mcp_page(self) -> None:
+        self.save_current_proxy_draft()
+        self.status_timer.stop()
+        self.mcp_page.load_config(self.config)
+        self.mcp_page.refresh()
+        self.stack.setCurrentWidget(self.mcp_page)
 
     def show_credentials(self) -> None:
         self.save_current_proxy_draft()
@@ -1481,6 +1313,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_status_loaded(self, status: dict[str, dict[str, Any]]) -> None:
         self.status_by_uuid = status
+        self.mcp_runtime.manager.update_catalog(self.config, self.server_page.clients, status)
         if self.stack.currentWidget() is self.proxy_page:
             self.proxy_page.update_metrics(status)
 
@@ -1739,6 +1572,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self.status_timer.stop()
         self.log_flush_timer.stop()
+        self.mcp_page.shutdown()
+        self.mcp_runtime.close()
         for uuid in list(self.proxy_servers):
             self.stop_proxy(uuid)
         for store in self.proxy_logs.values():
@@ -1849,6 +1684,24 @@ def _theme_stylesheet(theme: str) -> str:
             background: {c['bg']};
             border: 0;
         }}
+        QDialog {{
+            background: {c['bg']};
+        }}
+        QTabWidget::pane {{
+            border: 1px solid {c['border']};
+            background: {c['bg']};
+        }}
+        QTabBar::tab {{
+            background: {c['card']};
+            color: {c['muted']};
+            padding: 9px 16px;
+            border: 1px solid {c['border']};
+            border-bottom: 2px solid {c['border']};
+        }}
+        QTabBar::tab:selected {{
+            color: {c['text']};
+            border-bottom-color: {c['accent']};
+        }}
         QScrollArea#TransparentScroll, QWidget#ScrollContent {{
             background: transparent;
             border: 0;
@@ -1942,7 +1795,7 @@ def _theme_stylesheet(theme: str) -> str:
             background: {c['border']};
             margin: 5px 8px;
         }}
-        QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox {{
+        QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QComboBox {{
             background: {c['field']};
             border: 1px solid {c['border2']};
             border-radius: 8px;
@@ -1955,15 +1808,53 @@ def _theme_stylesheet(theme: str) -> str:
         QSpinBox#NoSpinButtons {{
             padding: 9px 10px;
         }}
-        QSpinBox#NoSpinButtons::up-button,
-        QSpinBox#NoSpinButtons::down-button {{
+        QSpinBox::up-button, QSpinBox::down-button {{
             width: 0;
             border: 0;
+        }}
+        QSpinBox::up-arrow, QSpinBox::down-arrow {{
+            image: none;
+            width: 0;
+            height: 0;
+        }}
+        QComboBox {{
+            padding-right: 36px;
+        }}
+        QComboBox::drop-down {{
+            subcontrol-origin: padding;
+            subcontrol-position: top right;
+            width: 29px;
+            border: 0;
+            background: transparent;
+        }}
+        QComboBox::down-arrow {{
+            image: none;
+            width: 0;
+            height: 0;
+        }}
+        QComboBox QAbstractItemView {{
+            background: {c['card']};
+            color: {c['text']};
+            border: 1px solid {c['border2']};
+            border-radius: 8px;
+            padding: 4px;
+            selection-background-color: {c['selected']};
+            selection-color: {c['selected_text']};
+            outline: 0;
+        }}
+        QComboBox QAbstractItemView::item {{
+            padding: 8px 12px;
+            min-height: 22px;
+            border-radius: 5px;
+        }}
+        QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled {{
+            color: {c['disabled_text']};
+            background: {c['disabled']};
         }}
         QTextEdit QWidget, QPlainTextEdit QWidget {{
             background: {c['field']};
         }}
-        QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QSpinBox:focus {{
+        QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QSpinBox:focus, QComboBox:focus {{
             border: 1px solid {c['accent']};
         }}
         QPushButton {{
@@ -2002,6 +1893,11 @@ def _theme_stylesheet(theme: str) -> str:
         QPushButton#Warning:hover {{
             background: {c['warn_hover']};
             border: 1px solid {c['warn_border']};
+        }}
+        QPushButton#Primary:disabled, QPushButton#Danger:disabled, QPushButton#Warning:disabled {{
+            color: {c['disabled_text']};
+            background: {c['disabled']};
+            border-color: {c['border']};
         }}
         QFrame#Segmented {{
             background: {c['surface']};
@@ -2191,6 +2087,7 @@ def proxy_settings_tuple(config: AgentConfig) -> tuple[Any, ...]:
         str(config.terminal_2fa_code),
         int(config.terminal_cols),
         int(config.terminal_rows),
+        int(config.ssh_sticky_minutes),
     )
 
 

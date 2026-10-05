@@ -26,11 +26,15 @@ def resource_path(relative_path: str) -> Path:
 APP_DIR = app_dir()
 CONFIG_PATH = APP_DIR / f"{APP_CONFIG_NAME}.ini"
 
-DEFAULT_USER_AGENT = "Mozilla/5.0 (compatible; KomariSSHProxy/1.0)"
+DEFAULT_USER_AGENT = "Mozilla/5.0 (compatible; KomariSSHProxy/1.1.0)"
 
 
 def generate_ssh_password() -> str:
     return "kp-" + secrets.token_urlsafe(12)
+
+
+def generate_mcp_password() -> str:
+    return "mcp-" + secrets.token_urlsafe(24)
 
 
 INI_FIELDS = [
@@ -87,6 +91,24 @@ INI_FIELDS = [
                 "ssh_host_key_pem为本地 SSH 服务端 Host Key 私钥，首次运行会自动生成并保存；请不要泄露或提交此项。",
                 lambda cfg: cfg.ssh_host_key_pem,
             ),
+            (
+                "ssh_sticky_minutes",
+                "粘性会话：本地 SSH 反代在远端断开后在此时长内自动重连并重挂原终端，0 表示关闭。",
+                lambda cfg: cfg.ssh_sticky_minutes,
+            ),
+        ],
+    ),
+    (
+        "mcp",
+        [
+            ("mcp_password", "MCP 独立 Bearer 密码，首次运行随机生成；不要泄露或提交此项。", lambda cfg: cfg.mcp_password),
+            ("mcp_port", "MCP HTTP 监听端口；服务和公网访问每次启动均默认关闭。", lambda cfg: cfg.mcp_port),
+            ("mcp_public_url", "可选的对外 MCP 地址，例如 https://mcp.example.com/mcp，不得包含凭据。", lambda cfg: cfg.mcp_public_url),
+            ("mcp_idle_minutes", "终端无输入/输出时自动断开的分钟数，0 表示关闭。心跳和读取不计入活动。", lambda cfg: cfg.mcp_idle_minutes),
+            ("mcp_sticky_minutes", "粘性会话：远端断开后在此时长内自动重连并重挂原终端，0 表示关闭。", lambda cfg: cfg.mcp_sticky_minutes),
+            ("assist_port", "共享终端的协助 SSH 本机端口。", lambda cfg: cfg.assist_port),
+            ("assist_username", "协助 SSH 用户名。", lambda cfg: cfg.assist_username),
+            ("assist_password", "协助 SSH 独立密码；不要泄露或提交此项。", lambda cfg: cfg.assist_password),
         ],
     ),
     (
@@ -151,10 +173,20 @@ class AgentConfig:
     ssh_username: str = "root"
     ssh_password: str = field(default_factory=generate_ssh_password)
     ssh_host_key_pem: str = ""
+    ssh_sticky_minutes: int = 5
     public_access: bool = False
     terminal_cols: int = 120
     terminal_rows: int = 36
     app_theme: str = "system"
+    mcp_password: str = field(default_factory=generate_mcp_password)
+    mcp_port: int = 12297
+    mcp_public_access: bool = False
+    mcp_public_url: str = ""
+    mcp_idle_minutes: int = 0
+    mcp_sticky_minutes: int = 5
+    assist_port: int = 12298
+    assist_username: str = "assist"
+    assist_password: str = field(default_factory=generate_mcp_password)
 
     @classmethod
     def load(cls, path: Path = CONFIG_PATH) -> "AgentConfig":
@@ -164,6 +196,7 @@ class AgentConfig:
         auth = parser["auth"] if parser.has_section("auth") else {}
         ssh = parser["ssh"] if parser.has_section("ssh") else {}
         app = parser["app"] if parser.has_section("app") else {}
+        mcp = parser["mcp"] if parser.has_section("mcp") else {}
 
         cfg.base_url = normalize_base_url(auth.get("base_url", cfg.base_url))
         cfg.user_agent = auth.get("user_agent", cfg.user_agent)
@@ -178,8 +211,17 @@ class AgentConfig:
         if saved_password:
             cfg.ssh_password = saved_password
         cfg.ssh_host_key_pem = ssh.get("ssh_host_key_pem", cfg.ssh_host_key_pem).strip()
+        cfg.ssh_sticky_minutes = _bounded_int(ssh.get("ssh_sticky_minutes"), 5, 0, 10080)
         cfg.app_theme = _theme(app.get("app_theme", auth.get("app_theme", cfg.app_theme)))
-        if path.exists() and (not saved_password or not cfg.ssh_host_key_pem):
+        cfg.mcp_password = mcp.get("mcp_password", "").strip() or cfg.mcp_password
+        cfg.mcp_port = _bounded_int(mcp.get("mcp_port"), 12297, 1, 65535)
+        cfg.mcp_public_url = mcp.get("mcp_public_url", "").strip()
+        cfg.mcp_idle_minutes = _bounded_int(mcp.get("mcp_idle_minutes"), 0, 0, 10080)
+        cfg.mcp_sticky_minutes = _bounded_int(mcp.get("mcp_sticky_minutes"), 5, 0, 10080)
+        cfg.assist_port = _bounded_int(mcp.get("assist_port"), 12298, 1, 65535)
+        cfg.assist_username = mcp.get("assist_username", "").strip() or "assist"
+        cfg.assist_password = mcp.get("assist_password", "").strip() or cfg.assist_password
+        if path.exists() and (not saved_password or not cfg.ssh_host_key_pem or not mcp.get("mcp_password") or not mcp.get("assist_password")):
             cfg.save(path)
         return cfg
 
@@ -231,3 +273,11 @@ class AgentConfig:
 def _theme(value: str | None) -> str:
     value = (value or "system").strip().lower()
     return value if value in {"system", "dark", "light"} else "system"
+
+
+def _bounded_int(value: str | None, default: int, minimum: int, maximum: int) -> int:
+    try:
+        number = int(value) if value is not None else default
+    except (ValueError, TypeError):
+        return default
+    return number if minimum <= number <= maximum else default

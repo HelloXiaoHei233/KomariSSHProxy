@@ -45,6 +45,15 @@ jobs:
       - name: Compile sources
         run: python -m compileall .
 
+      - name: Test MCP and terminal collaboration
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m unittest discover -s tests -v
+          if ($LASTEXITCODE -ne 0) { throw 'MCP tests failed' }
+
   build-windows:
     name: Build Windows EXE
     runs-on: windows-latest
@@ -66,6 +75,16 @@ jobs:
 
       - name: Build onefile executable
         run: python -m PyInstaller --noconfirm --clean KomariSSHProxy.spec
+
+      - name: Check packaged MCP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exePath = (Resolve-Path -LiteralPath 'dist/Komari SSH Proxy.exe').Path
+          $reportPath = Join-Path $env:RUNNER_TEMP 'komari-mcp-check.txt'
+          $check = Start-Process -FilePath $exePath -ArgumentList @('--check-mcp', '--check-mcp-report', ('"{0}"' -f $reportPath)) -WindowStyle Hidden -PassThru -Wait
+          if (Test-Path -LiteralPath $reportPath) { Get-Content -LiteralPath $reportPath -Encoding UTF8 }
+          if ($check.ExitCode -ne 0) { throw 'Packaged MCP check failed' }
 
       - name: Upload executable artifact
         uses: actions/upload-artifact@v5
@@ -92,14 +111,11 @@ jobs:
         shell: pwsh
         run: |
           @"
-          Komari SSH Proxy 的自动构建版本。
+          新增粘性会话与 SFTP 支持与 MCP 协助功能
 
-          - 支持将 Komari 面板 Web 终端反代为本地 SSH
-          - 支持多服务器、多端口同时代理
-          - 支持 PowerShell / curl 请求智能识别
-          - 支持深色、浅色、跟随系统主题
-          - 支持实时日志、日志等级、TXT 导出
-          - Windows EXE 由 GitHub Actions 构建
+          * 粘性会话：兼容新版Komari的粘性会话防掉线功能
+          * SFTP：现在支持将新版Komari的文件接口转换为SFTP
+          * 新增了MCP 功能，以更好的支持AI进行操作
           "@ | Out-File -FilePath release-notes.md -Encoding utf8
 
       - name: Create release and upload executable

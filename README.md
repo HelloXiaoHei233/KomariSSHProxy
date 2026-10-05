@@ -13,13 +13,19 @@ Komari SSH Proxy 是一个 SSH 代理工具，用于把 Komari 面板的网页�
 - 支持多台服务器同时开启本地 SSH 代理
 - 实时指令流支持清空和导出 TXT。
 - 可选允许公网访问
-- 由于 Komari 网页终端接口只提供交互式终端流，不提供文件协议能力，因此无法处理 SFTP 请求。
+- 提供带独立密码鉴权的 MCP 交互终端桥，兼容无法使用 SSH `exec` 的 Agent。
+- MCP 支持独立多窗口、显式回车、Ctrl+C 等按键、输出游标、连接详情和可导出的操作日志。
+- 协助模式可将选中的 AI 终端共享为本机 SSH，支持用户实时监看与共同输入。
+- 支持 SFTP：本地 SSH 代理端口与协助端口都可直接使用 `sftp` / `scp` 传输节点文件。
+- 支持粘性会话：MCP 终端与本地 SSH 反代在远端短暂掉线后都会自动重连并重挂原终端，界面显示“重连中”。
 
 ## 界面
 
 ![服务器列表](docs/images/server-list.png)
 
 ![SSH 代理页面](docs/images/proxy-page.png)
+
+![MCP 界面](docs/images/mcp-dark.png)
 
 截图中的服务器名、IP 和日志均为示例数据。
 

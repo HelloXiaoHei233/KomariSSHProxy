@@ -46,6 +46,38 @@ class KomariClient:
             raise KomariError(message)
         return payload
 
+    def raw_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        data: bytes | None = None,
+        json_body: Any | None = None,
+        stream: bool = False,
+        referer: str | None = None,
+        timeout: float = 20,
+    ) -> requests.Response:
+        """发送不解析 JSON 的请求，供文件下载/上传等二进制通道使用。
+
+        调用方负责检查状态码并关闭响应；Cookie 与 User-Agent 仍由本客户端统一注入。
+        """
+        url = urljoin(self.base_url + "/", path.lstrip("/"))
+        merged = self._http_headers(referer=referer)
+        if headers:
+            merged.update(headers)
+        return self.session.request(
+            method,
+            url,
+            headers=merged,
+            params=params,
+            data=data,
+            json=json_body,
+            timeout=timeout,
+            stream=stream,
+        )
+
     def validate(self) -> list[dict[str, Any]]:
         self.get_xterm_settings()
         return self.get_clients()
@@ -95,8 +127,9 @@ class KomariClient:
         result = self.rpc_call("common:getNodesLatestStatus")
         return result if isinstance(result, dict) else {}
 
-    def connect_terminal(self, uuid: str, two_fa_code: str = "", timeout: float = 20):
-        url = self.terminal_ws_url(uuid, two_fa_code)
+    def connect_terminal(self, uuid: str, two_fa_code: str = "", timeout: float = 20,
+                         request_id: str = ""):
+        url = self.terminal_ws_url(uuid, two_fa_code, request_id)
         referer = f"{self.base_url}/terminal?uuid={quote(uuid)}"
         headers = [
             f"User-Agent: {self.config.user_agent}",
@@ -118,14 +151,18 @@ class KomariClient:
         ws.settimeout(None)
         return ws
 
-    def terminal_ws_url(self, uuid: str, two_fa_code: str = "") -> str:
+    def terminal_ws_url(self, uuid: str, two_fa_code: str = "", request_id: str = "") -> str:
         parsed = urlparse(self.base_url)
         ws_scheme = "wss" if parsed.scheme == "https" else "ws"
         path = f"/api/admin/client/{quote(uuid)}/terminal"
-        query = ""
+        # 带 request_id 时面板会把连接重挂到既有会话，且不再要求新的 2FA 验证码。
+        query: dict[str, str] = {}
         if two_fa_code.strip():
-            query = "?" + urlencode({"2fa_code": two_fa_code.strip()})
-        return f"{ws_scheme}://{parsed.netloc}{path}{query}"
+            query["2fa_code"] = two_fa_code.strip()
+        if request_id.strip():
+            query["request_id"] = request_id.strip()
+        suffix = "?" + urlencode(query) if query else ""
+        return f"{ws_scheme}://{parsed.netloc}{path}{suffix}"
 
     def _http_headers(self, referer: str | None = None) -> dict[str, str]:
         headers = {

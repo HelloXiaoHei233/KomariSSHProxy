@@ -17,6 +17,9 @@ dist/
 KomariSSHProxy.ini
 
 *.log
+mcp-operations*.jsonl*
+terminal-*.txt
+terminal-*.bin
 *.tmp
 tmp/
 
@@ -24,3 +27,6 @@ tmp/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# 运行期产生的临时产物目录
+artifacts/
