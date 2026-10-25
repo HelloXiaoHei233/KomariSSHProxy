@@ -20,7 +20,7 @@ except ImportError:  # pragma: no cover
     WebSocketTimeoutException = None
 
 from config import AgentConfig, CONFIG_PATH
-from komari_client import KomariClient
+from komari_client import KomariClient, TERMINAL_WAITING_MESSAGE
 from sftp_backend import sftp_subsystem_args
 
 
@@ -64,6 +64,7 @@ class TerminalBridge:
         self.log = log
         self.stop_event = threading.Event()
         self.ws = None
+        self._ws_reattached = False
         self.channel = None
         self._ws_lock = threading.Lock()
         self._reconnect_lock = threading.Lock()
@@ -176,27 +177,31 @@ class TerminalBridge:
             except Exception as exc:
                 if self.stop_event.is_set():
                     return
-                if not self._handle_disconnect(bridge_error(exc)):
+                if not self._handle_disconnect(bridge_error(exc), ws):
                     break
                 continue
             if opcode == ABNF.OPCODE_CLOSE or message is None:
-                if not self._handle_disconnect("远端已关闭会话"):
+                if not self._handle_disconnect("远端已关闭会话", ws):
                     break
                 continue
             if opcode not in {ABNF.OPCODE_TEXT, ABNF.OPCODE_BINARY} or not message:
                 continue
             raw = message.encode("utf-8", errors="replace") if isinstance(message, str) else bytes(message)
-            if opcode == ABNF.OPCODE_TEXT:
-                control = self._control_frame(raw)
+            control = self._control_frame(raw) if opcode == ABNF.OPCODE_TEXT else None
+            with self._ws_lock:
+                if ws is not self.ws:
+                    continue
+                if self._ws_reattached and opcode == ABNF.OPCODE_TEXT and raw == TERMINAL_WAITING_MESSAGE:
+                    continue
                 if control is not None:
                     if set(control) == {"request_id"}:
                         self._remember_request_id(str(control["request_id"]))
                         continue
-                    if control.get("type") == "close":
-                        if not self._handle_disconnect("远端已关闭会话"):
-                            break
-                        continue
-                    continue  # 其余协议帧（例如尺寸回执）不属于终端输出。
+            if control is not None:
+                if control.get("type") == "close":
+                    if not self._handle_disconnect("远端已关闭会话", ws):
+                        break
+                continue  # 其余协议帧（例如尺寸回执）不属于终端输出。
             try:
                 self.channel.sendall(raw)
                 self.log(f"OUT WS  -> SSH {len(raw)} bytes  {preview_bytes(raw)}")
@@ -224,13 +229,16 @@ class TerminalBridge:
         if int(getattr(self.config, "ssh_sticky_minutes", 0) or 0):
             self.log("已取得面板会话标识：远端掉线时会自动重挂同一终端")
 
-    def _handle_disconnect(self, reason: str) -> bool:
+    def _handle_disconnect(self, reason: str, ws: Any = None) -> bool:
         """远端掉线后的统一出口：可粘性重连返回 True，否则结束桥接并返回 False。"""
         if self.stop_event.is_set():
             return False
         if not self._reconnect_lock.acquire(blocking=False):
             return True  # 已有线程在重连，这里直接让出，避免重复重挂。
         try:
+            with self._ws_lock:
+                if ws is not None and ws is not self.ws:
+                    return True
             minutes = int(getattr(self.config, "ssh_sticky_minutes", 0) or 0)
             request_id = self.remote_request_id
             if not minutes or not request_id:
@@ -275,6 +283,7 @@ class TerminalBridge:
                     self._close_socket(ws)
                     return False
                 self.ws = ws
+                self._ws_reattached = True
             self.reconnect_attempts += 1
             self.log(f"当前会话已重建，终端继续可用（第 {self.reconnect_attempts} 次尝试）")
             self.send_resize(self.cols, self.rows)
@@ -283,12 +292,14 @@ class TerminalBridge:
 
     def _heartbeat_loop(self) -> None:
         while not self.stop_event.wait(10):
-            if self.ws is None:
+            with self._ws_lock:
+                ws = self.ws
+            if ws is None:
                 continue  # 重连期间不发心跳，重挂成功后自动恢复。
             payload = json.dumps(
                 {"type": "heartbeat", "timestamp": datetime.utcnow().isoformat() + "Z"}
             )
-            if not self._send_text(payload) and not self._handle_disconnect("心跳发送失败"):
+            if not self._send_text(payload, ws=ws) and not self._handle_disconnect("心跳发送失败", ws):
                 return
 
     def _send_binary(self, data: bytes) -> bool:
@@ -302,17 +313,17 @@ class TerminalBridge:
             except Exception:
                 return False  # 掉线判定统一交给读取侧，避免两处各自重连。
 
-    def _send_text(self, text: str) -> bool:
+    def _send_text(self, text: str, *, ws: Any = None) -> bool:
         with self._ws_lock:
-            ws = self.ws
-            if ws is None:
+            ws = self.ws if ws is None else ws
+            if ws is None or ws is not self.ws:
                 return False
             try:
                 ws.send(text, opcode=ABNF.OPCODE_TEXT)
                 return True
             except Exception as exc:
                 if not self.stop_event.is_set():
-                    self.log(f"WebSocket 写入失败: {exc}")
+                    self.log(f"WebSocket 写入失败: {bridge_error(exc)}")
                 return False
 
 

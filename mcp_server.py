@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from contextvars import ContextVar
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar, copy_context
 from dataclasses import replace
 import hashlib
 import hmac
@@ -18,6 +19,8 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from config import AgentConfig
+from mcp_files import FileOperations
+from terminal_exchange import send_and_read
 from ssh_assist import SharedSSHServer
 from ssh_bridge import load_or_create_host_key
 from terminal_sessions import (
@@ -27,23 +30,31 @@ from terminal_sessions import (
 
 
 ACTOR: ContextVar[str] = ContextVar("mcp_actor", default="mcp")
+CLIENT: ContextVar[str] = ContextVar("mcp_client", default="local")
 INSTRUCTIONS = """这是有状态的交互终端桥，不是 SSH exec 或命令执行 API。
 先 list_terminals，再 connect_terminal；每次连接都会新建独立窗口，并报告该服务器窗口数。
 后续操作必须使用 connection_id，不能用服务器 UUID 代替。
-send_input 只发送原文，不自动回车。输入命令后必须单独 send_key(key="Enter") 才会执行。
-Ctrl+C 使用 send_key(key="Ctrl+C")，其含义是中断前台程序，不是断开终端。
-方向键、Tab、Escape、Ctrl+D 等同样通过 send_key 发送。也可在 send_input 中显式发送控制字符。
-read_output 返回原始 PTY 流（含 ANSI，stdout/stderr 合并），没有可靠的命令退出码或完成边界。
-先读前 N 行/字节；持续读取时将 next_cursor 传作下一次 cursor，可用 wait_ms 等待新输出。
-max_lines 与 max_bytes 同时设置时以先达到的限制为准；tail=true 读取末尾，且不能传 cursor。
-游标单位是原始字节。text 为 UTF-8 预览；多字节边界和二进制内容以 data_base64 为准。
+send_and_read 是唯一终端输入输出工具；text 可省略，不自动回车，pwd"Enter" 可一次输入并执行。
+"Ctrl+C" 中断前台程序；方向键、Tab 等也支持引号语法。
+需要原样输入带引号的键名（例如 echo "Enter"）时传 parse_keys=false。未知键名和其他文本原样保留。
+返回原始 PTY 流（含 ANSI，stdout/stderr 合并），没有可靠的命令退出码或完成边界。
+wait.mode=time 等待 wait_ms；idle 等待收到新输出后连续 idle_ms 无新字节；match 等待新输出出现 pattern 后 after_ms。
+match 支持 regex=true；所有等待都有独立的 max_wait_ms 上限，0 立即刷新；关闭或取消提前返回，重连中不当作关闭。
+read.mode=all/new/tail_bytes/tail_lines，分别返回全部保留、本次输入前位置之后的新增、末 count 字节/行。
+不填 text、wait 使用默认零毫秒即可刷新；new 不填 text 时从本次调用开始观察。条件只观察本次调用后的输出。
+默认仅返回 text；需要无损字节时传 include_base64=true 获取 data_base64。
+长等待可自选唯一 wait_id，另一次 send_and_read 传 cancel_wait_id 停止它并让原调用返回最后输出；不会中断远端程序。
+协议取消可能由客户端/SDK关闭响应，输出仍保留，可零毫秒刷新。原生跨POST取消使用同一Mcp-Client-Id请求头隔离客户端。
 每窗口保留最近 4 MiB，dropped_bytes 表示游标之前的输出已淘汰；不同读取者互不消费数据。
 用户可以通过界面或协助 SSH 同时输入。操作前查看 get_connection 的协作者和最近活动。
 协助 SSH 只监听本机，由用户在界面启用；退出 SSH 连接仅退出协助，输入 exit/Ctrl+D 可能关闭共享 shell。
 远端开启 ECHO 时才能看到输入回显；程序关闭 ECHO 时不会额外回显密码或按键。
 任务结束请 disconnect_terminal。关闭 MCP 会断开所有 MCP 终端及协助 SSH。
-远端短暂掉线时窗口会进入 reconnecting 并在粘性时限内自动重挂原终端，超时才真正断开。
-SFTP 不是 MCP 工具：它由本地 SSH 代理端口和协助端口提供，可用 sftp / scp 传输节点文件。
+reconnecting 表示连接断开，正在自动重连；请保留 connection_id 并等待恢复，不要新建窗口或重复发送输入。
+超过粘性时限或远端会话已结束时才终止连接。发送失败的输入不会自动重放，恢复后先检查输出。
+file_operation 使用 SSH SFTP 共用的面板原生文件接口，无需先打开终端。支持列目录、读文件、上传下载、重命名、权限和属主。
+local_path 指 MCP 服务所在电脑的路径。upload 遇到同名文件失败，不支持上传替换或合成替换流程。
+面板没有原子无覆盖参数；本服务串行化同节点文件操作，但不能消除外部写入者的竞争。
 """
 
 
@@ -54,11 +65,51 @@ def schema(properties: dict[str, Any] | None = None, required: tuple[str, ...] =
 
 CONNECTION = {"type": "string", "minLength": 1, "maxLength": 128,
               "description": "connect_terminal 返回的独立窗口 connection_id。"}
+MILLISECONDS = {"type": "integer", "minimum": 0, "maximum": 600000}
+WAIT_SCHEMA = {"oneOf": [
+    schema({"mode": {"const": "time"}, "wait_ms": MILLISECONDS, "max_wait_ms": MILLISECONDS},
+           ("mode", "wait_ms", "max_wait_ms")),
+    schema({"mode": {"const": "idle"}, "idle_ms": MILLISECONDS, "max_wait_ms": MILLISECONDS},
+           ("mode", "idle_ms", "max_wait_ms")),
+    schema({"mode": {"const": "match"}, "pattern": {"type": "string", "minLength": 1, "maxLength": 2048},
+            "regex": {"type": "boolean", "default": False}, "after_ms": MILLISECONDS,
+            "max_wait_ms": MILLISECONDS}, ("mode", "pattern", "after_ms", "max_wait_ms")),
+]}
+READ_SCHEMA = {"oneOf": [
+    schema({"mode": {"enum": ["all", "new"]}}, ("mode",)),
+    schema({"mode": {"const": "tail_bytes"}, "count": {"type": "integer", "minimum": 1, "maximum": MAX_OUTPUT_BYTES}}, ("mode", "count")),
+    schema({"mode": {"const": "tail_lines"}, "count": {"type": "integer", "minimum": 1, "maximum": MAX_OUTPUT_BYTES}}, ("mode", "count")),
+]}
+PATH = {"type": "string", "minLength": 1, "maxLength": 4096}
+MODE = {"type": "string", "pattern": "^[0-7]{3,4}$"}
+OFFSET = {"type": "integer", "minimum": 0}
+FILE_VARIANTS = {
+    "roots": ({}, ()),
+    "list": ({"path": PATH, "offset": OFFSET, "limit": {"type": "integer", "minimum": 1, "maximum": 1000}}, ("path",)),
+    "stat": ({"path": PATH}, ("path",)),
+    "read": ({"path": PATH, "offset": OFFSET, "length": {"type": "integer", "minimum": 1, "maximum": MAX_READ_BYTES}, "include_base64": {"type": "boolean"}}, ("path",)),
+    "upload": ({"path": PATH, "local_path": PATH}, ("path", "local_path")),
+    "download": ({"path": PATH, "local_path": PATH}, ("path", "local_path")),
+    "mkdir": ({"path": PATH, "mode": MODE}, ("path",)),
+    "rename": ({"path": PATH, "destination": PATH}, ("path", "destination")),
+    "chmod": ({"path": PATH, "mode": MODE}, ("path", "mode")),
+    "chown": ({"path": PATH, "uid": OFFSET, "gid": OFFSET}, ("path",)),
+    "delete": ({"path": PATH, "recursive": {"type": "boolean", "default": False}}, ("path",)),
+}
+FILE_SCHEMA = {"type": "object", "oneOf": [schema({
+    "server_uuid": CONNECTION, "operation": {"const": action}, **fields},
+    ("server_uuid", "operation", *required)) for action, (fields, required) in FILE_VARIANTS.items()]}
+for _variant in FILE_SCHEMA["oneOf"]:
+    if _variant["properties"]["operation"]["const"] == "chown":
+        _variant["anyOf"] = [{"required": ["uid"]}, {"required": ["gid"]}]
 TOOLS: dict[str, dict[str, Any]] = {
     "get_help": dict(description="完整交互规则、鉴权及调用示例。", inputSchema=schema()),
     "get_service_info": dict(description="MCP 监听、HTTP 请求活动、协助 SSH、连接数和限制；不含密码。", inputSchema=schema()),
-    "list_terminals": dict(description="列出面板所有服务器终端、最近在线状态及各服务器窗口数。", inputSchema=schema({
+    "list_terminals": dict(description="仅列 UUID、名称和在线状态；query 按名称、UUID、IP、系统、分组、地区检索，空格分隔多个关键词取并集。IP等详情请指定UUID调用get_terminal。", inputSchema=schema({
+        "query": {"type": "string", "maxLength": 256, "default": ""},
         "refresh": {"type": "boolean", "default": False, "description": "true 从面板重新获取服务器和状态。"}})),
+    "get_terminal": dict(description="按唯一 UUID 查看单台服务器完整信息及性能快照，用于筛查同名节点；refresh=true 重新从面板取数。", inputSchema=schema({
+        "server_uuid": CONNECTION, "refresh": {"type": "boolean", "default": False}}, ("server_uuid",))),
     "list_connections": dict(description="检查所有 MCP 窗口的详细状态、时间、计数、端点及协助者。", inputSchema=schema({
         "include_closed": {"type": "boolean", "default": False}})),
     "get_connection": dict(description="查看指定窗口和服务器的完整连接详情。", inputSchema=schema({"connection_id": CONNECTION}, ("connection_id",))),
@@ -70,24 +121,19 @@ TOOLS: dict[str, dict[str, Any]] = {
         "two_fa_code": {"type": "string", "maxLength": 32, "default": "", "description": "面板需要时填写；仅用于本次连接，不存储。"},
     }, ("server_uuid",))),
     "disconnect_terminal": dict(description="断开指定窗口及其协助者，原始流可在历史记录保留期间读取。重复断开安全。", inputSchema=schema({"connection_id": CONNECTION}, ("connection_id",))),
-    "send_input": dict(description="按原样输入文本，绝不自动追加回车。输入命令后必须另调用 send_key(Enter)。", inputSchema=schema({
-        "connection_id": CONNECTION, "text": {"type": "string", "minLength": 1, "maxLength": MAX_INPUT_BYTES},
-    }, ("connection_id", "text"))),
-    "send_key": dict(description="显式发送 Enter、Ctrl+C、Tab、方向键等终端按键。Ctrl+C 中断前台程序，连接仍保留。", inputSchema=schema({
-        "connection_id": CONNECTION, "key": {"type": "string", "enum": list(KEYS)},
-        "repeat": {"type": "integer", "minimum": 1, "maximum": 100, "default": 1},
-    }, ("connection_id", "key"))),
+    "send_and_read": dict(description='可选输入并等待后读取；空输入、零等待立即刷新。支持固定时间、输出静默、关键词/正则后延时和独立最大等待。', inputSchema=schema({
+        "connection_id": CONNECTION, "text": {"type": "string", "maxLength": MAX_INPUT_BYTES, "default": ""},
+        "parse_keys": {"type": "boolean", "default": True,
+                       "description": "将双引号包裹的已知键名转换为按键；false 保留全部原文。"},
+        "wait": WAIT_SCHEMA, "read": READ_SCHEMA,
+        "include_base64": {"type": "boolean", "default": False},
+        "wait_id": CONNECTION, "cancel_wait_id": CONNECTION,
+    }, ("connection_id",))),
     "resize_terminal": dict(description="调整共享 PTY 尺寸；会影响同一窗口的所有协助者。", inputSchema=schema({
         "connection_id": CONNECTION, "cols": {"type": "integer", "minimum": 20, "maximum": 500},
         "rows": {"type": "integer", "minimum": 8, "maximum": 300},
     }, ("connection_id", "cols", "rows"))),
-    "read_output": dict(description="按独立字节游标读取前 N 行/字节或末尾输出；不消费他人输出。可长轮询等待。", inputSchema=schema({
-        "connection_id": CONNECTION, "cursor": {"type": ["integer", "null"], "minimum": 0, "default": None},
-        "max_lines": {"type": ["integer", "null"], "minimum": 1, "maximum": 10000, "default": 200},
-        "max_bytes": {"type": "integer", "minimum": 1, "maximum": MAX_READ_BYTES, "default": 65536},
-        "tail": {"type": "boolean", "default": False},
-        "wait_ms": {"type": "integer", "minimum": 0, "maximum": 30000, "default": 0},
-    }, ("connection_id",))),
+    "file_operation": dict(description="面板原生文件管理：roots/list/stat/read/upload/download/mkdir/rename/chmod/chown/delete。路径是节点绝对虚拟路径，local_path 是MCP主机绝对路径；上传和重命名拒绝同名目标，不提供替换。", inputSchema=FILE_SCHEMA),
     "read_operation_logs": dict(description="按游标读取可导出的操作日志流；不记录密码或输入正文。", inputSchema=schema({
         "cursor": {"type": "integer", "minimum": 0, "default": 0},
         "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 200},
@@ -105,10 +151,11 @@ def public_help() -> str:
     examples = [
         {"name": "list_terminals", "arguments": {}},
         {"name": "connect_terminal", "arguments": {"server_uuid": "<SERVER_UUID>", "label": "诊断"}},
-        {"name": "send_input", "arguments": {"connection_id": "<CONNECTION_ID>", "text": "pwd"}},
-        {"name": "send_key", "arguments": {"connection_id": "<CONNECTION_ID>", "key": "Enter"}},
-        {"name": "read_output", "arguments": {"connection_id": "<CONNECTION_ID>", "max_lines": 100, "max_bytes": 65536}},
-        {"name": "send_key", "arguments": {"connection_id": "<CONNECTION_ID>", "key": "Ctrl+C"}},
+        {"name": "send_and_read", "arguments": {"connection_id": "<CONNECTION_ID>", "text": 'pwd"Enter"',
+            "wait": {"mode": "idle", "idle_ms": 300, "max_wait_ms": 10000}, "read": {"mode": "new"}}},
+        {"name": "send_and_read", "arguments": {"connection_id": "<CONNECTION_ID>", "read": {"mode": "tail_lines", "count": 100}}},
+        {"name": "send_and_read", "arguments": {"connection_id": "<CONNECTION_ID>", "text": '"Ctrl+C"'}},
+        {"name": "file_operation", "arguments": {"server_uuid": "<SERVER_UUID>", "operation": "list", "path": "/tmp"}},
         {"name": "disconnect_terminal", "arguments": {"connection_id": "<CONNECTION_ID>"}},
     ]
     return ("Komari SSH Proxy · MCP 操作帮助\n\n"
@@ -127,10 +174,19 @@ def public_help() -> str:
                 "clientInfo": {"name": "your-agent", "version": "1.0"}}}, ensure_ascii=False, indent=2)
             + "\n初始化后发送 notifications/initialized。后续请求携带协商的 MCP-Protocol-Version。\n"
             "无 HTTP 会话 ID；终端使用 connection_id 保留状态。协议通知使用 202 空响应。\n"
-            "远端掉线时窗口进入 reconnecting 并在粘性时限内自动重挂；SFTP 由本地 SSH 与协助端口提供，不是 MCP 工具。\n"
+            "远端掉线时窗口进入 reconnecting 并在粘性时限内自动重挂；文件管理由 file_operation 提供。\n"
             "输入错误会返回明确参数路径和期望格式；网络错误不会回显 Cookie、2FA 或密码。\n\n"
             "全部工具与严格参数格式（禁止未声明字段）：\n"
             + json.dumps(TOOLS, ensure_ascii=False, indent=2))
+
+
+QUOTED_KEY = re.compile(r'"(' + "|".join(re.escape(key) for key in KEYS) + r')"')
+
+
+def encode_terminal_input(text: str, parse_keys: bool = True) -> bytes:
+    if parse_keys:
+        text = QUOTED_KEY.sub(lambda match: KEYS[match[1]].decode("ascii"), text)
+    return text.encode("utf-8")
 
 
 def validate_password(password: str) -> None:
@@ -269,10 +325,13 @@ class HttpGuard:
             return
         identity = self.owner.request_started(scope, headers)
         token = ACTOR.set(f"mcp:{peer}")
+        client_token = CLIENT.set(hashlib.sha256(
+            (identity + ":" + headers.get(b"mcp-client-id", b"").decode("latin-1")).encode()).hexdigest())
         try:
             await self.app(scope, receive, send)
         finally:
             ACTOR.reset(token)
+            CLIENT.reset(client_token)
             self.owner.request_finished(identity)
 
 
@@ -289,6 +348,7 @@ class MCPHttpServer:
         self._error = ""
         self._lock = threading.Lock()
         self._clients: dict[str, dict[str, Any]] = {}
+        self._executor: ThreadPoolExecutor | None = None
 
     @property
     def running(self) -> bool:
@@ -310,21 +370,50 @@ class MCPHttpServer:
         except ImportError:
             raise TerminalError("MCP 需要新版依赖，请运行 python -m pip install -r requirements.txt 后重启。") from None
 
+        with self._lock:
+            if self._executor is None:
+                # A fixed pool reserves capacity beyond the 16 wait slots even
+                # on low-core machines, where asyncio's default pool is small.
+                self._executor = ThreadPoolExecutor(max_workers=32, thread_name_prefix="mcp-tool")
+            executor = self._executor
+
         async def list_tools(context, params):
             return types.ListToolsResult(tools=[types.Tool(name=name, **definition) for name, definition in TOOLS.items()])
 
         async def call_tool(context, params):
+            cancel_event = threading.Event()
+            key = (CLIENT.get(), type(context.request_id).__name__, str(context.request_id))
+            registered = False
             try:
-                result = await asyncio.to_thread(self.runtime.dispatch, params.name, params.arguments)
+                if key in requests_in_flight:
+                    raise TerminalError("该客户端的 requestId 正在使用；请使用唯一 ID 或独立 Mcp-Client-Id。")
+                requests_in_flight[key] = cancel_event
+                registered = True
+                ctx = copy_context()
+                result = await asyncio.get_running_loop().run_in_executor(executor, lambda: ctx.run(
+                    self.runtime.dispatch, params.name, params.arguments, cancel_event=cancel_event))
                 return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(result, ensure_ascii=False))],
                                             structuredContent=result, isError=False)
             except TerminalError as exc:
                 result = {"error": str(exc), "help": "调用 get_help 或访问 GET / 查看完整参数说明。"}
                 return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(result, ensure_ascii=False))],
                                             structuredContent=result, isError=True)
+            finally:
+                cancel_event.set()
+                if registered:
+                    requests_in_flight.pop(key, None)
 
-        server = Server("komari-terminal", version="1.1.0", instructions=INSTRUCTIONS,
+        requests_in_flight = {}
+
+        async def cancel_tool(context, params):
+            key = (CLIENT.get(), type(params.request_id).__name__, str(params.request_id))
+            event = requests_in_flight.get(key)
+            if event is not None:
+                event.set()
+
+        server = Server("komari-terminal", version="1.2.0", instructions=INSTRUCTIONS,
                         on_list_tools=list_tools, on_call_tool=call_tool)
+        server.add_notification_handler("notifications/cancelled", types.CancelledNotificationParams, cancel_tool)
         # HttpGuard validates both Host and Origin, including configured reverse-proxy domains.
         app = server.streamable_http_app(json_response=True, stateless_http=True,
                                          max_request_body_size=1024 * 1024,
@@ -369,6 +458,10 @@ class MCPHttpServer:
                 self.runtime.log.add("mcp_server_error", reason=self._error)
             finally:
                 listener.close()
+                with self._lock:
+                    executor, self._executor = self._executor, None
+                if executor is not None:
+                    executor.shutdown(wait=False, cancel_futures=True)
 
         self._thread = threading.Thread(target=run, name="mcp-http", daemon=True)
         self._thread.start()
@@ -386,6 +479,11 @@ class MCPHttpServer:
             self._server.should_exit = True
         if self._thread and self._thread is not threading.current_thread():
             self._thread.join(timeout=5)
+        if not self._thread or not self._thread.is_alive():
+            with self._lock:
+                executor, self._executor = self._executor, None
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
 
     def request_started(self, scope: dict, headers: dict) -> str:
         peer = scope.get("client") or ("unknown", 0)
@@ -430,6 +528,10 @@ class McpRuntime:
         self._lock = threading.RLock()
         self._closed = False
         self._validators: dict = {}
+        self.files = FileOperations(self.manager)
+        self._wait_lock = threading.Lock()
+        self._waits: dict[tuple[str, str, str], threading.Event] = {}
+        self._wait_slots = threading.BoundedSemaphore(16)
 
     def update_config(self, config: AgentConfig) -> None:
         self.config = replace(config)
@@ -476,15 +578,16 @@ class McpRuntime:
         return dict(mcp=self.http.info(), assist=self.assist.info() if self.assist else {"running": False},
                     terminals=self.manager.list_connections()["open_window_count"],
                     limits=dict(max_connections=MAX_CONNECTIONS, output_bytes_per_window=MAX_OUTPUT_BYTES,
-                                max_read_bytes=MAX_READ_BYTES, max_input_bytes=MAX_INPUT_BYTES,
+                                max_read_bytes=MAX_OUTPUT_BYTES, max_input_bytes=MAX_INPUT_BYTES,
+                                max_concurrent_waits=16, max_wait_ms=600000,
                                 idle_disconnect_minutes=self.manager.config.mcp_idle_minutes,
                                 sticky_reconnect_minutes=self.manager.config.mcp_sticky_minutes),
-                    sftp=dict(transport="ssh-subsystem",
-                              endpoints=["local-ssh-proxy", "assist-ssh"],
+                    sftp=dict(transport="panel-native-file-api",
+                              endpoints=["local-ssh-proxy", "assist-ssh", "MCP file_operation"],
                               note="通过面板文件接口读写节点文件，支持 sftp 与 scp。"),
-                    input_requires_explicit_enter=True)
+                    input_requires_explicit_enter=True, quoted_keys_in_send_and_read=True)
 
-    def dispatch(self, name: str, arguments: Any = None) -> dict[str, Any]:
+    def dispatch(self, name: str, arguments: Any = None, *, cancel_event=None) -> dict[str, Any]:
         from jsonschema import Draft202012Validator
 
         definition = TOOLS.get(name)
@@ -496,7 +599,7 @@ class McpRuntime:
         if error is not None:
             path = ".".join(str(part) for part in error.absolute_path) or "arguments"
             # Do not interpolate ValidationError.message: it can repeat a password or input text.
-            reason = {"additionalProperties": "含未声明字段"}.get(error.validator)
+            reason = {"additionalProperties": "含未声明字段", "oneOf": "不满足该模式的参数要求；请检查必填字段及类型"}.get(error.validator)
             if error.validator == "required":
                 missing = [field for field in error.validator_value if field not in error.instance]
                 reason = "缺少必填字段：" + ", ".join(missing)
@@ -504,12 +607,13 @@ class McpRuntime:
                 reason = f"不满足 {error.validator}={json.dumps(error.validator_value, ensure_ascii=False)}"
             self.log.add("invalid_arguments", actor=ACTOR.get(), tool=name, field=path)
             raise TerminalError(f"参数 {path}：{reason}；请参考该工具 inputSchema。")
-        args = dict(args)
-        for field, value in args.items():
-            field_type = definition["inputSchema"]["properties"][field].get("type")
-            if isinstance(value, float) and (field_type == "integer" or isinstance(field_type, list) and "integer" in field_type):
-                # JSON Schema defines 2.0 as an integer; normalize before slicing/range/byte repeat.
-                args[field] = int(value)
+        def normalize(value):
+            if isinstance(value, dict):
+                return {key: normalize(item) for key, item in value.items()}
+            if isinstance(value, float) and value.is_integer():
+                return int(value)
+            return value
+        args = normalize(args)
         actor = ACTOR.get()
         try:
             if name == "get_help":
@@ -519,7 +623,14 @@ class McpRuntime:
             if name == "list_terminals":
                 if args.get("refresh", False):
                     self.manager.refresh_catalog()
-                return self.manager.list_terminals()
+                result = self.manager.list_terminals(query=args.get("query", ""))
+                fields = {"uuid", "name", "online"}
+                return dict(terminals=[{key: value for key, value in item.items() if key in fields}
+                                      for item in result["terminals"]], total=result["total"])
+            if name == "get_terminal":
+                if args.get("refresh", False):
+                    self.manager.refresh_catalog()
+                return self.manager.get_terminal(args["server_uuid"])
             if name == "list_connections":
                 return self.manager.list_connections(**args)
             if name == "get_connection":
@@ -528,19 +639,13 @@ class McpRuntime:
                 return self.manager.connect(**args, actor=actor)
             if name == "disconnect_terminal":
                 return self.manager.disconnect(**args, actor=actor)
-            if name == "send_input":
-                return self.manager.get(args["connection_id"]).send(args["text"].encode("utf-8"), actor=actor)
-            if name == "send_key":
-                return self.manager.send_key(**args, actor=actor)
+            if name == "send_and_read":
+                return self._exchange(args, actor, cancel_event)
+            if name == "file_operation":
+                return self.files.run(**args, actor=actor)
             if name == "resize_terminal":
                 options = dict(args)
                 return self.manager.get(options.pop("connection_id")).resize(**options, actor=actor)
-            if name == "read_output":
-                options = {"max_lines": 200, **args}
-                result = self.manager.read_output(**options)
-                self.log.add("read_output", actor=actor, connection_id=args["connection_id"],
-                             bytes=result["bytes_returned"], next_cursor=result["next_cursor"])
-                return result
             if name == "read_operation_logs":
                 return self.log.read(**args)
         except TerminalError:
@@ -549,6 +654,46 @@ class McpRuntime:
             self.log.add("tool_failed", actor=actor, tool=name, reason=type(exc).__name__)
             raise TerminalError(f"操作失败（{type(exc).__name__}），请检查连接详情和操作日志。") from None
         raise TerminalError("工具尚未实现。")
+
+    def _exchange(self, args, actor, cancel_event):
+        options = dict(args)
+        identity = options.pop("connection_id")
+        session = self.manager.get(identity)
+        raw = encode_terminal_input(options.pop("text", ""), options.pop("parse_keys", True))
+        if len(raw) > MAX_INPUT_BYTES:
+            raise TerminalError(f"输入不能超过 {MAX_INPUT_BYTES} 字节。")
+        cancel_id = options.pop("cancel_wait_id", None)
+        wait_id = options.pop("wait_id", None)
+        event = cancel_event or threading.Event()
+        key = (CLIENT.get(), identity, wait_id)
+        waiting = options.get("wait", {}).get("max_wait_ms", 0) > 0
+        if waiting and not self._wait_slots.acquire(blocking=False):
+            raise TerminalError("同时等待已达 16 个；请先取消一个等待，或使用零毫秒刷新。")
+        registered = False
+        try:
+            with self._wait_lock:
+                if wait_id and key in self._waits:
+                    raise TerminalError("wait_id 正在使用，请为每次等待选择唯一 ID。")
+                if cancel_id:
+                    target = self._waits.get((CLIENT.get(), identity, cancel_id))
+                    if target is None:
+                        raise TerminalError("找不到该 cancel_wait_id 的活动等待。")
+                    target.set()
+                if wait_id:
+                    self._waits[key] = event
+                    registered = True
+            result = send_and_read(session, raw, actor=actor, cancel_event=event, **options)
+            if wait_id:
+                result["wait_id"] = wait_id
+            self.log.add("send_and_read", actor=actor, connection_id=identity,
+                         bytes=result["bytes_returned"], wait_reason=result["wait_reason"])
+            return result
+        finally:
+            if registered:
+                with self._wait_lock:
+                    self._waits.pop(key, None)
+            if waiting:
+                self._wait_slots.release()
 
     def close(self) -> None:
         with self._lock:

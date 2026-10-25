@@ -106,6 +106,7 @@ INI_FIELDS = [
             ("mcp_public_url", "可选的对外 MCP 地址，例如 https://mcp.example.com/mcp，不得包含凭据。", lambda cfg: cfg.mcp_public_url),
             ("mcp_idle_minutes", "终端无输入/输出时自动断开的分钟数，0 表示关闭。心跳和读取不计入活动。", lambda cfg: cfg.mcp_idle_minutes),
             ("mcp_sticky_minutes", "粘性会话：远端断开后在此时长内自动重连并重挂原终端，0 表示关闭。", lambda cfg: cfg.mcp_sticky_minutes),
+            ("mcp_auto_open", "新连接自动显示终端窗口，默认关闭；修改后立即保存。", lambda cfg: cfg.mcp_auto_open),
             ("assist_port", "共享终端的协助 SSH 本机端口。", lambda cfg: cfg.assist_port),
             ("assist_username", "协助 SSH 用户名。", lambda cfg: cfg.assist_username),
             ("assist_password", "协助 SSH 独立密码；不要泄露或提交此项。", lambda cfg: cfg.assist_password),
@@ -138,7 +139,7 @@ def render_ini(config: "AgentConfig") -> str:
         f"# {APP_DISPLAY_NAME} 配置文件。",
         "# 允许添加以 # 或 ; 开头的独立注释行。",
         "# 不建议把注释放在字段同一行尾部，因为 Cookie 里可能包含分号或特殊字符。",
-        "# SSH 密码和 Host Key 会作为默认值保存；端口、用户名、公网访问、终端尺寸、2FA 验证码仍为运行时配置。",
+        "# SSH 密码和 Host Key 会保存；普通 SSH 反代端口与用户名、公网访问开关、终端尺寸、2FA 验证码为运行时配置。",
         "",
     ]
     for section, fields in INI_FIELDS:
@@ -184,6 +185,7 @@ class AgentConfig:
     mcp_public_url: str = ""
     mcp_idle_minutes: int = 0
     mcp_sticky_minutes: int = 5
+    mcp_auto_open: bool = False
     assist_port: int = 12298
     assist_username: str = "assist"
     assist_password: str = field(default_factory=generate_mcp_password)
@@ -218,6 +220,7 @@ class AgentConfig:
         cfg.mcp_public_url = mcp.get("mcp_public_url", "").strip()
         cfg.mcp_idle_minutes = _bounded_int(mcp.get("mcp_idle_minutes"), 0, 0, 10080)
         cfg.mcp_sticky_minutes = _bounded_int(mcp.get("mcp_sticky_minutes"), 5, 0, 10080)
+        cfg.mcp_auto_open = str(mcp.get("mcp_auto_open", "false")).strip().lower() in {"true", "1", "yes", "on"}
         cfg.assist_port = _bounded_int(mcp.get("assist_port"), 12298, 1, 65535)
         cfg.assist_username = mcp.get("assist_username", "").strip() or "assist"
         cfg.assist_password = mcp.get("assist_password", "").strip() or cfg.assist_password

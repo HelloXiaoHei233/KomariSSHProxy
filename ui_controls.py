@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from PyQt6 import QtCore, QtGui, QtWidgets
+from PyQt6 import QtCore, QtGui, QtSvg, QtWidgets
+
+
+from config import APP_DISPLAY_NAME
 
 
 CONTEXT_MENU_LABELS = {
@@ -291,3 +294,289 @@ class AppComboBox(QtWidgets.QComboBox):
     def leaveEvent(self, event: QtCore.QEvent) -> None:
         self.update()
         super().leaveEvent(event)
+
+
+SVG_ICONS = {
+    "system": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<rect x="4" y="5" width="16" height="11" rx="1.8" fill="none" '
+        'stroke="{color}" stroke-width="1.8"/>'
+        '<path d="M9 20h6M12 16v4" fill="none" stroke="{color}" '
+        'stroke-width="1.8" stroke-linecap="round"/></svg>'
+    ),
+    "dark": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<path d="M20 14.4A7.6 7.6 0 0 1 9.6 4a8.1 8.1 0 1 0 10.4 10.4z" '
+        'fill="none" stroke="{color}" stroke-width="1.8" stroke-linejoin="round"/></svg>'
+    ),
+    "light": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<circle cx="12" cy="12" r="3.5" fill="none" stroke="{color}" stroke-width="1.8"/>'
+        '<path d="M12 2.5v2.2M12 19.3v2.2M4.6 4.6l1.6 1.6M17.8 17.8l1.6 1.6'
+        'M2.5 12h2.2M19.3 12h2.2M4.6 19.4l1.6-1.6M17.8 6.2l1.6-1.6" '
+        'fill="none" stroke="{color}" stroke-width="1.8" stroke-linecap="round"/></svg>'
+    ),
+    "minimize": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<path d="M7 12h10" fill="none" stroke="{color}" stroke-width="1.8" '
+        'stroke-linecap="round"/></svg>'
+    ),
+    "maximize": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<rect x="7" y="7" width="10" height="10" rx="1" fill="none" '
+        'stroke="{color}" stroke-width="1.8"/></svg>'
+    ),
+    "restore": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<path d="M9 7h8v8" fill="none" stroke="{color}" stroke-width="1.8" '
+        'stroke-linejoin="round"/>'
+        '<rect x="7" y="9" width="8" height="8" rx="1" fill="none" '
+        'stroke="{color}" stroke-width="1.8"/></svg>'
+    ),
+    "close": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<path d="M7.5 7.5l9 9M16.5 7.5l-9 9" fill="none" stroke="{color}" '
+        'stroke-width="1.8" stroke-linecap="round"/></svg>'
+    ),
+}
+
+
+class SvgIconButton(QtWidgets.QPushButton):
+    def __init__(self, icon_name: str, *, close: bool = False):
+        super().__init__()
+        self.icon_name = icon_name
+        self.is_close_button = close
+        self.setObjectName("CloseButton" if close else "WindowButton")
+        self.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.setFixedSize(34, 34)
+
+    def set_icon_name(self, icon_name: str) -> None:
+        self.icon_name = icon_name
+        self.update()
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        rect = self.rect()
+        dark = self._is_dark()
+        hovered = self.underMouse()
+        down = self.isDown()
+
+        if self.is_close_button and hovered:
+            bg = QtGui.QColor("#c93f4a")
+            icon_color = "#ffffff"
+        else:
+            bg = QtGui.QColor("#2e2e2e" if dark else "#e6eeea")
+            if down:
+                bg = QtGui.QColor("#3a3a3a" if dark else "#d8e5df")
+            elif not hovered:
+                bg.setAlpha(0)
+            icon_color = "#dddddd" if dark else "#36443e"
+
+        if bg.alpha() > 0:
+            painter.setPen(QtCore.Qt.PenStyle.NoPen)
+            painter.setBrush(bg)
+            painter.drawRoundedRect(rect.adjusted(2, 2, -2, -2), 8, 8)
+
+        svg = SVG_ICONS[self.icon_name].format(color=icon_color).encode("utf-8")
+        renderer = QtSvg.QSvgRenderer(svg)
+        icon_rect = QtCore.QRectF(
+            (rect.width() - 16) / 2,
+            (rect.height() - 16) / 2,
+            16,
+            16,
+        )
+        renderer.render(painter, icon_rect)
+
+    @staticmethod
+    def _is_dark() -> bool:
+        app = QtWidgets.QApplication.instance()
+        return bool(app and app.property("effective_theme") == "dark")
+
+
+class TitleBar(QtWidgets.QFrame):
+    theme_requested = QtCore.pyqtSignal()
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None, *, show_theme: bool = True):
+        super().__init__(parent)
+        self.setObjectName("TitleBar")
+        self.setFixedHeight(46)
+        self._drag_pos: QtCore.QPoint | None = None
+
+        self.title = QtWidgets.QLabel(APP_DISPLAY_NAME)
+        self.title.setObjectName("WindowTitle")
+        self.title.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+        self.title.setMinimumWidth(0)
+        self.title.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred)
+        self.theme_btn = SvgIconButton("system")
+        self.theme_btn.setVisible(show_theme)
+        self.min_btn = SvgIconButton("minimize")
+        self.max_btn = SvgIconButton("maximize")
+        self.close_btn = SvgIconButton("close", close=True)
+
+        self.theme_btn.clicked.connect(self.theme_requested.emit)
+        self.min_btn.clicked.connect(lambda: self.window().showMinimized())
+        self.max_btn.clicked.connect(self.toggle_maximized)
+        self.close_btn.clicked.connect(lambda: self.window().close())
+
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setContentsMargins(16, 0, 8, 0)
+        layout.setSpacing(8)
+        layout.addWidget(self.title, 1)
+        layout.addWidget(self.theme_btn)
+        layout.addWidget(self.min_btn)
+        layout.addWidget(self.max_btn)
+        layout.addWidget(self.close_btn)
+
+    def set_theme_mode(self, mode: str) -> None:
+        labels = {"system": "跟随系统", "dark": "暗色模式", "light": "亮色模式"}
+        icons = {"system": "system", "dark": "dark", "light": "light"}
+        self.theme_btn.set_icon_name(icons.get(mode, "system"))
+        self.theme_btn.setToolTip(labels.get(mode, "跟随系统"))
+
+    def toggle_maximized(self) -> None:
+        window = self.window()
+        if window.isMaximized():
+            window.showNormal()
+            self.max_btn.set_icon_name("maximize")
+        else:
+            window.showMaximized()
+            self.max_btn.set_icon_name("restore")
+
+    def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self.toggle_maximized()
+            event.accept()
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == QtCore.Qt.MouseButton.LeftButton and not self.window().isMaximized():
+            self._drag_pos = event.globalPosition().toPoint() - self.window().frameGeometry().topLeft()
+            event.accept()
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        if self._drag_pos is not None and event.buttons() & QtCore.Qt.MouseButton.LeftButton:
+            self.window().move(event.globalPosition().toPoint() - self._drag_pos)
+            event.accept()
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        self._drag_pos = None
+        event.accept()
+
+
+class WindowResizeHandle(QtWidgets.QWidget):
+    """Delegate edge drags to the OS, with a fallback for other Qt platforms."""
+
+    def __init__(self, window: QtWidgets.QWidget, edges: QtCore.Qt.Edge,
+                 cursor: QtCore.Qt.CursorShape):
+        super().__init__(window)
+        self.edges = edges
+        self.setObjectName("WindowResizeHandle")
+        self.setCursor(cursor)
+        self._drag_origin: QtCore.QPoint | None = None
+        self._drag_geometry = QtCore.QRect()
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        # Windows layered windows pass mouse events through fully transparent pixels.
+        painter = QtGui.QPainter(self)
+        painter.fillRect(self.rect(), QtGui.QColor(0, 0, 0, 1))
+
+    def _start_system_resize(self) -> bool:
+        handle = self.window().windowHandle()
+        return bool(handle and handle.startSystemResize(self.edges))
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        window = self.window()
+        if (event.button() != QtCore.Qt.MouseButton.LeftButton
+                or window.isMaximized() or window.isFullScreen()):
+            return
+        self._drag_origin = None
+        if not self._start_system_resize():
+            self._drag_origin = event.globalPosition().toPoint()
+            self._drag_geometry = window.geometry()
+        event.accept()
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        if self._drag_origin is None or not event.buttons() & QtCore.Qt.MouseButton.LeftButton:
+            return
+        window = self.window()
+        delta = event.globalPosition().toPoint() - self._drag_origin
+        rect = QtCore.QRect(self._drag_geometry)
+        minimum = window.minimumSize().expandedTo(window.minimumSizeHint())
+        edge = QtCore.Qt.Edge
+        if self.edges & edge.LeftEdge:
+            width = max(minimum.width(), min(window.maximumWidth(), rect.width() - delta.x()))
+            rect.setLeft(rect.right() - width + 1)
+        elif self.edges & edge.RightEdge:
+            rect.setWidth(max(minimum.width(), min(window.maximumWidth(), rect.width() + delta.x())))
+        if self.edges & edge.TopEdge:
+            height = max(minimum.height(), min(window.maximumHeight(), rect.height() - delta.y()))
+            rect.setTop(rect.bottom() - height + 1)
+        elif self.edges & edge.BottomEdge:
+            rect.setHeight(max(minimum.height(), min(window.maximumHeight(), rect.height() + delta.y())))
+        window.setGeometry(rect)
+        event.accept()
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        self._drag_origin = None
+        event.accept()
+
+
+class FramelessWindow(QtWidgets.QMainWindow):
+    """Shared border and corner resize areas for the application windows."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlag(QtCore.Qt.WindowType.FramelessWindowHint, True)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        edge, cursor = QtCore.Qt.Edge, QtCore.Qt.CursorShape
+        self.resize_handles = {
+            edges: WindowResizeHandle(self, edges, shape)
+            for edges, shape in (
+                (edge.LeftEdge, cursor.SizeHorCursor),
+                (edge.RightEdge, cursor.SizeHorCursor),
+                (edge.TopEdge, cursor.SizeVerCursor),
+                (edge.BottomEdge, cursor.SizeVerCursor),
+                (edge.TopEdge | edge.LeftEdge, cursor.SizeFDiagCursor),
+                (edge.TopEdge | edge.RightEdge, cursor.SizeBDiagCursor),
+                (edge.BottomEdge | edge.LeftEdge, cursor.SizeBDiagCursor),
+                (edge.BottomEdge | edge.RightEdge, cursor.SizeFDiagCursor),
+            )
+        }
+
+    def _position_resize_handles(self) -> None:
+        if not hasattr(self, "resize_handles"):
+            return
+        edge = QtCore.Qt.Edge
+        border, corner = 10, 18
+        width, height = self.width(), self.height()
+        rectangles = {
+            edge.LeftEdge: (0, corner, border, height - 2 * corner),
+            edge.RightEdge: (width - border, corner, border, height - 2 * corner),
+            edge.TopEdge: (corner, 0, width - 2 * corner, border),
+            edge.BottomEdge: (corner, height - border, width - 2 * corner, border),
+            edge.TopEdge | edge.LeftEdge: (0, 0, corner, corner),
+            edge.TopEdge | edge.RightEdge: (width - corner, 0, corner, corner),
+            edge.BottomEdge | edge.LeftEdge: (0, height - corner, corner, corner),
+            edge.BottomEdge | edge.RightEdge: (width - corner, height - corner, corner, corner),
+        }
+        enabled = not self.isMaximized() and not self.isFullScreen()
+        for edges, handle in self.resize_handles.items():
+            handle.setGeometry(*rectangles[edges])
+            handle.setVisible(enabled)
+            handle.raise_()
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._position_resize_handles()
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        super().showEvent(event)
+        self._position_resize_handles()
+
+    def changeEvent(self, event: QtCore.QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() == QtCore.QEvent.Type.WindowStateChange:
+            self._position_resize_handles()
+            if hasattr(self, "title_bar"):
+                self.title_bar.max_btn.set_icon_name("restore" if self.isMaximized() else "maximize")

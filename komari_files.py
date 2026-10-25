@@ -28,6 +28,7 @@ READ_BLOCK = 256 * 1024
 
 # 分类顺序敏感：「client not found」属于离线而不是文件缺失。
 _ERROR_KINDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("exists", ("already exists", "file exists")),
     ("offline", ("agent is not connected", "client not found", "agent offline")),
     ("unsupported", ("unsupported file operation", "does not support file operations",
                      "web control is disabled", "not implemented", "unimplemented")),
