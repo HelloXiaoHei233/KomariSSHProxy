@@ -15,7 +15,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 from config import AgentConfig, generate_mcp_password
 from mcp_server import McpRuntime, agent_instructions, validate_password, validate_public_url
 from terminal_sessions import ACTIVE_STATES, KEYS, STATUS_LABELS, TerminalError
-from ui_controls import AppCheckBox, AppComboBox, AppLineEdit, AppPlainTextEdit, AppSpinBox
+from ui_controls import AppCheckBox, AppComboBox, AppLineEdit, AppPlainTextEdit, AppSpinBox, FramelessWindow, TitleBar
 
 
 def button(text: str, kind: str = "") -> QtWidgets.QPushButton:
@@ -127,7 +127,27 @@ class TerminalPreview(AppPlainTextEdit):
         self.setReadOnly(True)
         self.setMaximumBlockCount(5000)
         self.setFont(QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.SystemFont.FixedFont))
-        self.setPlaceholderText("点击这里直接输入按键。Enter 回车，Ctrl+C 中断，Ctrl+Shift+C 复制选中内容。")
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_InputMethodEnabled, True)
+        self._preedit = QtWidgets.QLabel(self.viewport())
+        self._preedit.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+        self._preedit.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._preedit.setAutoFillBackground(True)
+        self._preedit.hide()
+
+    def inputMethodQuery(self, query):
+        queries = QtCore.Qt.InputMethodQuery
+        if query == queries.ImEnabled:
+            return True
+        if query in {queries.ImSurroundingText, queries.ImCurrentSelection,
+                     queries.ImTextBeforeCursor, queries.ImTextAfterCursor}:
+            return ""
+        if query in {queries.ImCursorPosition, queries.ImAnchorPosition, queries.ImAbsolutePosition}:
+            return 0
+        if query == queries.ImCursorRectangle:
+            cursor = QtGui.QTextCursor(self.document())
+            cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
+            return self.cursorRect(cursor).translated(self.viewport().pos())
+        return super().inputMethodQuery(query)
 
     def event(self, event) -> bool:
         if event.type() == QtCore.QEvent.Type.KeyPress and event.key() in {QtCore.Qt.Key.Key_Tab, QtCore.Qt.Key.Key_Backtab}:
@@ -168,12 +188,25 @@ class TerminalPreview(AppPlainTextEdit):
     def inputMethodEvent(self, event) -> None:
         if event.commitString():
             self.input_requested.emit(event.commitString().encode("utf-8"))
+        self._preedit.setText(event.preeditString())
+        if event.preeditString():
+            palette = self.palette()
+            palette.setColor(QtGui.QPalette.ColorRole.Window, palette.color(QtGui.QPalette.ColorRole.Base))
+            palette.setColor(QtGui.QPalette.ColorRole.WindowText, palette.color(QtGui.QPalette.ColorRole.Text))
+            self._preedit.setPalette(palette)
+            self._preedit.setFont(self.font())
+            self._preedit.adjustSize()
+            rect = self.inputMethodQuery(QtCore.Qt.InputMethodQuery.ImCursorRectangle)
+            point = self.viewport().mapFrom(self, rect.topLeft())
+            self._preedit.move(max(0, min(point.x(), self.viewport().width() - self._preedit.width())),
+                               max(0, min(point.y(), self.viewport().height() - self._preedit.height())))
+        self._preedit.setVisible(bool(event.preeditString()))
         event.accept()
 
 
-class TerminalWindow(QtWidgets.QDialog):
+class TerminalWindow(FramelessWindow):
     def __init__(self, page: "McpPage", connection_id: str):
-        super().__init__(page)
+        super().__init__()
         self.page = page
         self.connection_id = connection_id
         self.cursor = 0
@@ -182,24 +215,15 @@ class TerminalWindow(QtWidgets.QDialog):
         self.resize(960, 620)
         self.setMinimumSize(680, 440)
         self.setObjectName("McpTerminalWindow")
-        self.setAutoFillBackground(True)
+        self.setWindowIcon(page.window().windowIcon())
+        self.title_bar = TitleBar(self, show_theme=False)
+        self.windowTitleChanged.connect(self.title_bar.title.setText)
         self.status = QtWidgets.QLabel()
         self.status.setTextFormat(QtCore.Qt.TextFormat.PlainText)
         self.status.setWordWrap(True)
         self.output = TerminalPreview()
         self.output.input_requested.connect(lambda raw: page.queue_input(connection_id, raw))
         self.output.key_requested.connect(lambda key: page.queue_input(connection_id, KEYS[key], key))
-        self.input = AppLineEdit()
-        self.input.setPlaceholderText("也可在这里编辑文本，再点发送；不会自动回车")
-        send = button("发送文本")
-        send.clicked.connect(self.send_text)
-        self.input.returnPressed.connect(self.send_text)
-        enter = button("Enter 回车", "Primary")
-        enter.clicked.connect(lambda: page.queue_input(connection_id, KEYS["Enter"], "Enter"))
-        interrupt = button("Ctrl+C 中断", "Warning")
-        interrupt.clicked.connect(lambda: page.queue_input(connection_id, KEYS["Ctrl+C"], "Ctrl+C"))
-        disconnect = button("断开此终端", "Danger")
-        disconnect.clicked.connect(lambda: page.run_task(lambda: page.runtime.manager.disconnect(connection_id, actor="gui")))
         details = button("连接详情")
         details.clicked.connect(lambda: page.show_connection_details(connection_id))
         export = button("导出保留的输出")
@@ -208,28 +232,27 @@ class TerminalWindow(QtWidgets.QDialog):
         top.addWidget(self.status, 1)
         top.addWidget(details)
         top.addWidget(export)
-        input_row = QtWidgets.QHBoxLayout()
-        input_row.addWidget(self.input, 1)
-        input_row.addWidget(send)
-        input_row.addWidget(enter)
-        input_row.addWidget(interrupt)
-        input_row.addWidget(disconnect)
-        note = QtWidgets.QLabel("文本预览 · 原始流可通过 MCP / 协助 SSH 读取。Ctrl+Shift+C 复制；关闭本窗口只隐藏，需点“断开此终端”结束连接。")
-        note.setWordWrap(True)
-        note.setObjectName("Muted")
-        layout = QtWidgets.QVBoxLayout(self)
+        content = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(content)
+        layout.setContentsMargins(12, 12, 12, 12)
         layout.addLayout(top)
         layout.addWidget(self.output, 1)
-        layout.addLayout(input_row)
-        layout.addWidget(note)
+        shell = QtWidgets.QFrame()
+        shell.setObjectName("AppShell")
+        shell_layout = QtWidgets.QVBoxLayout(shell)
+        shell_layout.setContentsMargins(1, 1, 1, 1)
+        shell_layout.setSpacing(0)
+        shell_layout.addWidget(self.title_bar)
+        shell_layout.addWidget(content, 1)
+        root = QtWidgets.QWidget()
+        root.setObjectName("Root")
+        root_layout = QtWidgets.QVBoxLayout(root)
+        root_layout.setContentsMargins(8, 8, 8, 8)
+        root_layout.addWidget(shell)
+        self.setCentralWidget(root)
         self.timer = QtCore.QTimer(self)
         self.timer.setInterval(100)
         self.timer.timeout.connect(self.poll)
-
-    def send_text(self) -> None:
-        if self.input.text():
-            self.page.queue_input(self.connection_id, self.input.text().encode("utf-8"))
-            self.input.clear()
 
     def poll(self) -> None:
         try:
@@ -284,6 +307,7 @@ class TerminalWindow(QtWidgets.QDialog):
         self.timer.start()
         self.poll()
         super().showEvent(event)
+        self.output.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
 
     def closeEvent(self, event) -> None:
         self.timer.stop()
@@ -415,7 +439,8 @@ class McpPage(QtWidgets.QWidget):
             actions.addWidget(control)
         actions.addStretch(1)
         self.auto_open = AppCheckBox("新连接自动显示窗口")
-        self.auto_open.setChecked(True)
+        self.auto_open.setChecked(self.config.mcp_auto_open)
+        self.auto_open.toggled.connect(self.save_auto_open)
         actions.addWidget(self.auto_open)
         self.counts = QtWidgets.QLabel()
         self.counts.setObjectName("Muted")
@@ -487,6 +512,7 @@ class McpPage(QtWidgets.QWidget):
         config.mcp_public_url = validate_public_url(self.public_url.text().strip())
         config.mcp_idle_minutes = self.idle.value()
         config.mcp_sticky_minutes = self.sticky.value()
+        config.mcp_auto_open = self.auto_open.isChecked()
         config.assist_port = self.assist_port.value()
         config.assist_username = self.assist_user.text().strip()
         config.assist_password = self.assist_password.text()
@@ -503,6 +529,8 @@ class McpPage(QtWidgets.QWidget):
 
     def load_config(self, config: AgentConfig) -> None:
         self.config = config
+        with QtCore.QSignalBlocker(self.auto_open):
+            self.auto_open.setChecked(config.mcp_auto_open)
         if not self.runtime.http.running:
             self.password.setText(config.mcp_password)
             self.port.setValue(config.mcp_port)
@@ -513,6 +541,19 @@ class McpPage(QtWidgets.QWidget):
             self.assist_port.setValue(config.assist_port)
             self.assist_user.setText(config.assist_username)
             self.assist_password.setText(config.assist_password)
+
+    def save_auto_open(self, enabled: bool) -> None:
+        # Save this preference independently of unfinished service settings.
+        config = replace(self.config, mcp_auto_open=enabled)
+        try:
+            self.save_config(config)
+        except OSError:
+            with QtCore.QSignalBlocker(self.auto_open):
+                self.auto_open.setChecked(self.config.mcp_auto_open)
+            self.show_error("无法保存窗口显示设置，请检查程序目录的写入权限。")
+            return
+        self.config = config
+        self.runtime.update_config(config)
 
     def toggle_mcp(self) -> None:
         if self._busy:
@@ -587,6 +628,7 @@ class McpPage(QtWidgets.QWidget):
         window.show()
         window.raise_()
         window.activateWindow()
+        window.output.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
 
     def interrupt_selected(self) -> None:
         if identity := self.require_selected():
@@ -760,3 +802,5 @@ class McpPage(QtWidgets.QWidget):
         self.runtime.manager.on_event = None
         for window in self.windows.values():
             window.close()
+            window.deleteLater()
+        self.windows.clear()

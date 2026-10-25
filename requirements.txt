@@ -5,3 +5,4 @@ paramiko>=3.4
 mcp>=2.2,<3
 jsonschema>=4.20
 uvicorn>=0.35,<1
+regex>=2024.11.6

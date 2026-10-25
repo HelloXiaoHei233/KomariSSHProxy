@@ -1,7 +1,6 @@
 """Independent, shared Komari PTY sessions. No SSH exec emulation is involved."""
 from __future__ import annotations
 
-import base64
 from collections import deque
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -18,7 +17,7 @@ from uuid import uuid4
 from websocket import ABNF, WebSocketTimeoutException
 
 from config import AgentConfig
-from komari_client import KomariClient, normalize_latest_status
+from komari_client import KomariClient, TERMINAL_WAITING_MESSAGE, normalize_latest_status
 
 
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
@@ -27,6 +26,7 @@ MAX_INPUT_BYTES = 64 * 1024
 MAX_CONNECTIONS = 32
 MAX_HISTORY = 32
 ACTIVE_STATES = {"connecting", "connected", "reconnecting"}
+RECONNECTING_MESSAGE = "连接断开，正在自动重连..."
 STATUS_LABELS = {
     "connecting": "连接中",
     "connected": "已连接",
@@ -129,11 +129,13 @@ class OutputBuffer:
         self.base = 0
         self.end = 0
         self.closed = False
+        self.last_append_at = 0.0
 
     def append(self, data: bytes) -> None:
         with self.condition:
-            if self.closed:
+            if self.closed or not data:
                 return
+            self.last_append_at = time.monotonic()
             self.end += len(data)
             self.data.extend(data)
             excess = max(0, len(self.data) - self.capacity)
@@ -242,6 +244,7 @@ class TerminalSession:
         self._send_lock = threading.Lock()
         self._stop = threading.Event()
         self._ws: Any = None
+        self._ws_reattached = False
         self._threads: list[threading.Thread] = []
         self._collaborators: dict[str, dict[str, Any]] = {}
         # 粘性会话：面板在 request_id 存活期内允许重挂同一终端，因此掉线后可以续接。
@@ -259,6 +262,7 @@ class TerminalSession:
                 if self._stop.is_set():
                     raise TerminalError("连接已被用户取消。")
                 self._ws = ws
+                self._ws_reattached = False
                 self.status = "connected"
                 self.connected_at = utc_now()
                 self.last_activity = time.monotonic()
@@ -319,18 +323,24 @@ class TerminalSession:
             except Exception as exc:
                 if self._stop.is_set():
                     return
-                if not self._handle_disconnect(connection_error(exc)):
+                if not self._handle_disconnect(connection_error(exc), ws):
                     return
                 continue
             if opcode == ABNF.OPCODE_CLOSE or data is None:
-                if not self._handle_disconnect("remote_closed"):
+                if not self._handle_disconnect("remote_closed", ws):
                     return
                 continue
             if opcode not in {ABNF.OPCODE_TEXT, ABNF.OPCODE_BINARY} or not data:
                 continue
             raw = data.encode("utf-8") if isinstance(data, str) else bytes(data)
-            if opcode == ABNF.OPCODE_TEXT:
-                control = self._control_frame(raw)
+            control = self._control_frame(raw) if opcode == ABNF.OPCODE_TEXT else None
+            with self._lock:
+                # Check after parsing and keep state changes atomic with socket replacement.
+                # A delayed close/request_id from the old socket must not affect its successor.
+                if ws is not self._ws:
+                    continue
+                if self._ws_reattached and opcode == ABNF.OPCODE_TEXT and raw == TERMINAL_WAITING_MESSAGE:
+                    continue
                 if control is not None:
                     if set(control) == {"request_id"}:
                         self._remember_request_id(str(control["request_id"]))
@@ -338,11 +348,10 @@ class TerminalSession:
                     if control.get("type") == "close":
                         self.close(reason="remote_closed")
                         return
-            with self._lock:
                 self.bytes_received += len(raw)
                 self.last_output_at = utc_now()
                 self.last_activity = time.monotonic()
-            self.output.append(raw)
+                self.output.append(raw)
 
     @staticmethod
     def _control_frame(raw: bytes) -> dict[str, Any] | None:
@@ -367,22 +376,17 @@ class TerminalSession:
                              sticky=bool(getattr(self.config, "mcp_sticky_minutes", 0)),
                              message="已取得面板会话标识，粘性重连已就绪。")
 
-    def _handle_disconnect(self, reason: str) -> bool:
+    def _handle_disconnect(self, reason: str, ws: Any) -> bool:
         """远端掉线后的统一出口：可粘性重连返回 True，否则终止会话并返回 False。"""
         minutes = int(getattr(self.config, "mcp_sticky_minutes", 0) or 0)
         with self._lock:
             if self._stop.is_set():
                 return False
+            if ws is not self._ws or self.status == "reconnecting":
+                return True  # Another reader/writer already handled this socket.
             request_id = self.remote_request_id
-        if not minutes or not request_id:
-            self.close(reason=reason, error=True)
-            return False
-        return self._reconnect(reason, minutes, request_id)
-
-    def _reconnect(self, reason: str, minutes: int, request_id: str) -> bool:
-        """在粘性窗口内退避重连并重挂原终端；成功返回 True。"""
-        with self._lock:
-            if self._stop.is_set():
+            if not minutes or not request_id:
+                self.close(reason=reason, error=True)
                 return False
             self.status = "reconnecting"
             self.reconnecting_since = utc_now()
@@ -391,22 +395,38 @@ class TerminalSession:
         self._close_socket(stale)
         self.manager.log.add("terminal_reconnecting", connection_id=self.connection_id,
                              reason=reason, window_minutes=minutes,
-                             message="会话断开，正在重建连接。")
+                             message=RECONNECTING_MESSAGE)
         self.manager.changed(self)
+        thread = threading.Thread(target=self._reconnect, args=(minutes, request_id),
+                                  name="mcp-terminal-reconnect", daemon=True)
+        with self._lock:
+            self._threads.append(thread)
+            thread.start()
+        return True
+
+    def _reconnect(self, minutes: int, request_id: str) -> bool:
+        """在粘性窗口内退避重连并重挂原终端；只有一个线程负责重挂。"""
         deadline = time.monotonic() + minutes * 60
         delay = 1.0
         while not self._stop.is_set():
             if time.monotonic() >= deadline:
                 self.close(reason=f"粘性重连超时（{minutes} 分钟）", error=True)
                 return False
-            if self._stop.wait(delay):
+            if self._stop.wait(min(delay, max(0, deadline - time.monotonic()))):
                 return False
+            if time.monotonic() >= deadline:
+                continue
             delay = min(delay * 2, 15.0)
-            client = self.manager.client_factory(self.config)
+            client = None
+            ws = None
             try:
-                ws = client.connect_terminal(self.server["uuid"], "", timeout=20,
+                client = self.manager.client_factory(self.config)
+                ws = client.connect_terminal(self.server["uuid"], "", timeout=min(20, max(0.1, deadline - time.monotonic())),
                                              request_id=request_id)
+                ws.settimeout(2)
             except Exception as exc:
+                if ws is not None:
+                    self._close_socket(ws)
                 with self._lock:
                     self.reconnect_attempts += 1
                 status = getattr(exc, "status_code", None)
@@ -418,16 +438,20 @@ class TerminalSession:
             finally:
                 session = getattr(client, "session", None)
                 if session is not None:
-                    session.close()
-            ws.settimeout(2)
+                    try:
+                        session.close()
+                    except Exception:
+                        pass  # Cleanup must not strand the terminal in reconnecting.
             with self._lock:
                 if self._stop.is_set():
                     self._close_socket(ws)
                     return False
                 self._ws = ws
+                self._ws_reattached = True
                 self.status = "connected"
                 self.reconnect_attempts += 1
                 self.reconnecting_since = None
+                self.close_reason = ""
                 self.last_activity = time.monotonic()
             self.manager.log.add("terminal_reconnected", connection_id=self.connection_id,
                                  attempts=self.reconnect_attempts,
@@ -453,39 +477,64 @@ class TerminalSession:
 
     def _send_control(self, payload: dict[str, Any]) -> None:
         with self._send_lock:
-            self._check_connected()
+            with self._lock:
+                self._check_connected()
+                ws = self._ws
             try:
-                self._ws.send(json.dumps(payload), opcode=ABNF.OPCODE_TEXT)
+                ws.send(json.dumps(payload), opcode=ABNF.OPCODE_TEXT)
             except Exception as exc:
-                self.close(reason=connection_error(exc), error=True)
+                if self._handle_disconnect(connection_error(exc), ws):
+                    raise TerminalError(RECONNECTING_MESSAGE + " 请等待原连接恢复。") from None
                 raise TerminalError("终端控制帧发送失败，连接已断开。") from None
 
     def _check_connected(self) -> None:
-        if self._stop.is_set() or self.status != "connected":
-            raise TerminalError(f"终端未连接（{self.status}）；请新建连接后重试。")
+        with self._lock:
+            if self.status == "reconnecting" and not self._stop.is_set():
+                raise TerminalError(RECONNECTING_MESSAGE + " 请保留 connection_id，等待恢复后再操作。")
+            if self._stop.is_set() or self.status != "connected":
+                raise TerminalError(f"终端未连接（{self.status}）；请新建连接后重试。")
 
-    def send(self, raw: bytes, *, actor: str, key: str | None = None) -> dict[str, Any]:
+    def send(self, raw: bytes, *, actor: str, key: str | None = None,
+             cancel_event: threading.Event | None = None) -> dict[str, Any]:
         if not raw or len(raw) > MAX_INPUT_BYTES:
             raise TerminalError(f"输入必须为 1 到 {MAX_INPUT_BYTES} 字节。")
-        with self._send_lock:
-            self._check_connected()
+        initial_output = self.output.bounds()["output_end"]
+
+        def cancelled_receipt():
+            return dict(connection_id=self.connection_id, bytes_sent=0, input_output_start=initial_output,
+                        appended_enter=False, message="输入已取消，未发送。")
+
+        while not self._send_lock.acquire(timeout=0.025):
+            if cancel_event is not None and cancel_event.is_set():
+                return cancelled_receipt()
+        try:
+            if cancel_event is not None and cancel_event.is_set():
+                return cancelled_receipt()
+            with self._lock:
+                self._check_connected()
+                ws = self._ws
+                output_start = self.output.bounds()["output_end"]
             try:
-                self._ws.send(raw, opcode=ABNF.OPCODE_BINARY)
+                ws.send(raw, opcode=ABNF.OPCODE_BINARY)
             except Exception as exc:
-                self.close(reason=connection_error(exc), error=True)
+                if self._handle_disconnect(connection_error(exc), ws):
+                    raise TerminalError(RECONNECTING_MESSAGE + " 本次输入未自动重放；恢复后请先检查输出。") from None
                 raise TerminalError("输入发送失败，连接已断开；请检查输出后再决定是否重试。") from None
             with self._lock:
                 self.bytes_sent += len(raw)
                 self.last_input_at = utc_now()
                 self.last_input_by = actor
                 self.last_activity = time.monotonic()
+        finally:
+            self._send_lock.release()
         details: dict[str, Any] = {"bytes": len(raw)}
         if key is not None:
             details["key"] = key
         self.manager.log.add("send_key" if key else "send_input", actor=actor,
                              connection_id=self.connection_id, **details)
         return dict(connection_id=self.connection_id, bytes_sent=len(raw),
-                    appended_enter=False, message="按原样发送；需要执行时请显式发送 Enter。")
+                    input_output_start=output_start,
+                    appended_enter=False, message="已发送指定输入，未自动追加回车。")
 
     def resize(self, cols: int, rows: int, *, actor: str) -> dict[str, Any]:
         if not 20 <= cols <= 500 or not 8 <= rows <= 300:
@@ -546,6 +595,7 @@ class TerminalSession:
             result = dict(
                 connection_id=self.connection_id, window_number=self.number, label=self.label,
                 server=dict(self.server), status=self.status, transport="komari-websocket-pty",
+                status_message=RECONNECTING_MESSAGE if self.status == "reconnecting" else STATUS_LABELS.get(self.status, self.status),
                 remote_endpoint=endpoint, created_by=self.created_by, created_at=self.created_at,
                 connected_at=self.connected_at, disconnected_at=self.disconnected_at,
                 last_input_at=self.last_input_at, last_output_at=self.last_output_at,
@@ -604,13 +654,18 @@ class TerminalManager:
             if session is not None:
                 session.close()
 
-    def list_terminals(self) -> dict[str, Any]:
+    def list_terminals(self, query: str = "") -> dict[str, Any]:
         with self._lock:
             servers = []
+            terms = query.casefold().split()
             for uuid, server in self._servers.items():
+                summary = public_fields(server, ("uuid", "name", "ipv4", "ipv6", "os", "group", "region"))
+                searchable = " ".join(str(value) for value in summary.values()).casefold()
+                if terms and not any(term in searchable for term in terms):
+                    continue
                 ids = [key for key, value in self._sessions.items()
                        if value.server["uuid"] == uuid and value.status in ACTIVE_STATES]
-                servers.append(dict(server, status=self._status.get(uuid, {}),
+                servers.append(dict(summary, online=self._status.get(uuid, {}).get("online"),
                                     open_window_count=len(ids), connection_ids=ids))
             return dict(terminals=servers, total=len(servers), catalog_updated_at=self.catalog_updated_at,
                         status_note="节点在线状态为最近一次面板快照；refresh=true 可刷新。")
@@ -618,6 +673,17 @@ class TerminalManager:
     def sessions(self) -> list[TerminalSession]:
         with self._lock:
             return list(self._sessions.values())
+
+    def get_terminal(self, server_uuid: str) -> dict[str, Any]:
+        with self._lock:
+            server = self._servers.get(server_uuid)
+            if server is None:
+                raise TerminalError("找不到服务器 UUID；请先调用 list_terminals。")
+            ids = [key for key, value in self._sessions.items()
+                   if value.server["uuid"] == server_uuid and value.status in ACTIVE_STATES]
+            return dict(server=dict(server), status=dict(self._status.get(server_uuid, {})),
+                        connection_ids=ids, open_window_count=len(ids),
+                        catalog_updated_at=self.catalog_updated_at)
 
     def get(self, connection_id: str) -> TerminalSession:
         with self._lock:
@@ -668,23 +734,6 @@ class TerminalManager:
         return dict(connection=session.snapshot(), already_open_windows=before,
                     open_window_count=current,
                     message=f"已新建独立终端窗口，该服务器当前已打开 {current} 个窗口（连接前 {before} 个）。已有窗口继续运行。")
-
-    def send_key(self, connection_id: str, key: str, repeat: int = 1, *, actor: str = "mcp") -> dict:
-        if key not in KEYS:
-            raise TerminalError("未知按键；支持：" + ", ".join(KEYS))
-        if not 1 <= repeat <= 100:
-            raise TerminalError("repeat 必须为 1 到 100。")
-        return self.get(connection_id).send(KEYS[key] * repeat, actor=actor, key=key)
-
-    def read_output(self, connection_id: str, **kwargs: Any) -> dict[str, Any]:
-        session = self.get(connection_id)
-        result = session.output.read(**kwargs)
-        raw = result.pop("data")
-        result.update(connection_id=connection_id, status=session.status,
-                      text=raw.decode("utf-8", errors="replace"),
-                      data_base64=base64.b64encode(raw).decode("ascii"),
-                      encoding="utf-8", stream="raw-pty (stdout/stderr merged; ANSI preserved)")
-        return result
 
     def disconnect(self, connection_id: str, *, actor: str = "mcp") -> dict[str, Any]:
         session = self.get(connection_id)

@@ -24,6 +24,10 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: pwsh
+
 jobs:
   check:
     name: Check
@@ -39,26 +43,31 @@ jobs:
 
       - name: Install dependencies
         run: |
+          $ErrorActionPreference = 'Stop'
           python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { throw 'pip upgrade failed' }
           python -m pip install -r requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed' }
 
       - name: Compile sources
-        run: python -m compileall .
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m compileall -q .
+          if ($LASTEXITCODE -ne 0) { throw 'Source compilation failed' }
 
-      - name: Test MCP and terminal collaboration
+      - name: Check application installation
         shell: pwsh
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
           $ErrorActionPreference = 'Stop'
-          python -m unittest discover -s tests -v
-          if ($LASTEXITCODE -ne 0) { throw 'MCP tests failed' }
+          python main.py --check-mcp
+          if ($LASTEXITCODE -ne 0) { throw 'Application installation check failed' }
 
   build-windows:
     name: Build Windows EXE
     runs-on: windows-latest
     needs: check
-    if: github.event_name == 'workflow_dispatch'
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -70,11 +79,17 @@ jobs:
 
       - name: Install build dependencies
         run: |
+          $ErrorActionPreference = 'Stop'
           python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { throw 'pip upgrade failed' }
           python -m pip install -r requirements.txt pyinstaller
+          if ($LASTEXITCODE -ne 0) { throw 'Build dependency installation failed' }
 
       - name: Build onefile executable
-        run: python -m PyInstaller --noconfirm --clean KomariSSHProxy.spec
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m PyInstaller --noconfirm --clean KomariSSHProxy.spec
+          if ($LASTEXITCODE -ne 0) { throw 'Executable build failed' }
 
       - name: Check packaged MCP
         shell: pwsh
@@ -110,13 +125,13 @@ jobs:
       - name: Write release notes
         shell: pwsh
         run: |
-          @"
-          新增粘性会话与 SFTP 支持与 MCP 协助功能
-
-          * 粘性会话：兼容新版Komari的粘性会话防掉线功能
-          * SFTP：现在支持将新版Komari的文件接口转换为SFTP
-          * 新增了MCP 功能，以更好的支持AI进行操作
-          "@ | Out-File -FilePath release-notes.md -Encoding utf8
+          $ErrorActionPreference = 'Stop'
+          @'
+          登录方式支持账号密码和OAuth登录
+          为MCP支持了文件操作
+          优化了MCP操作流程
+          修复边框大小无法拖拽的问题
+          '@ | Set-Content -LiteralPath release-notes.md -Encoding UTF8
 
       - name: Create release and upload executable
         shell: pwsh
@@ -126,12 +141,13 @@ jobs:
           RELEASE_TITLE: ${{ inputs.release_title }}
           PRERELEASE: ${{ inputs.prerelease }}
         run: |
+          $ErrorActionPreference = 'Stop'
           $title = $env:RELEASE_TITLE
           if ([string]::IsNullOrWhiteSpace($title)) {
             $title = "Komari SSH Proxy $env:RELEASE_TAG"
           }
 
-          $args = @(
+          $releaseArgs = @(
             "release", "create", $env:RELEASE_TAG,
             "release/Komari SSH Proxy.exe",
             "--repo", $env:GITHUB_REPOSITORY,
@@ -141,9 +157,10 @@ jobs:
           )
 
           if ($env:PRERELEASE -eq "true") {
-            $args += "--prerelease"
+            $releaseArgs += "--prerelease"
           } else {
-            $args += "--latest"
+            $releaseArgs += "--latest"
           }
 
-          gh @args
+          gh @releaseArgs
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }

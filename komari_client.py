@@ -11,6 +11,11 @@ import websocket
 from config import AgentConfig, normalize_base_url
 
 
+# Komari emits this exact TEXT frame while reattaching a browser to an agent.
+# Agent/PTY output uses BINARY frames, even when it contains the same text.
+TERMINAL_WAITING_MESSAGE = "等待被控端连接 waiting for agent...\n".encode("utf-8")
+
+
 class KomariError(RuntimeError):
     pass
 

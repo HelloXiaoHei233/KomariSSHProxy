@@ -22,63 +22,100 @@ MCP 是 Komari 网页终端与 Agent 之间的交互桥。它直接管理 WebSoc
 | 工具 | 用途 |
 | --- | --- |
 | `get_help` | 完整帮助、参数格式与示例 |
-| `get_service_info` | MCP 监听、最近 HTTP 请求活动、协助 SSH 客户端与资源限制 |
-| `list_terminals` | 所有面板服务器、最近状态、每台服务器的窗口数；`refresh=true` 重新获取面板数据 |
-| `list_connections` | 所有活动 MCP 窗口；`include_closed=true` 同时显示保留的历史 |
-| `get_connection` | 指定窗口的服务器、端点、尺寸、时间、流量、输出范围和协作者详情 |
-| `connect_terminal` | 新建独立窗口，返回窗口详情、连接前与连接后的窗口数 |
-| `disconnect_terminal` | 断开指定窗口；重复调用安全 |
-| `send_input` | 按原样输入文本，**不追加回车** |
-| `send_key` | 发送 Enter、Ctrl+A 至 Ctrl+Z、Tab、Escape、Backspace、Delete、方向键、Home/End、PageUp/PageDown、Shift+Tab |
+| `get_service_info` | MCP、协助 SSH 状态与资源限制 |
+| `list_terminals` | 只列 UUID、名称和在线状态；`query` 搜索，`refresh=true` 刷新 |
+| `get_terminal` | 按唯一 `server_uuid` 获取单台服务器详细配置、性能快照和已开窗口，`refresh=true` 刷新 |
+| `list_connections` | 活动 MCP 窗口；`include_closed=true` 包含保留的历史 |
+| `get_connection` | 指定窗口的完整详情 |
+| `connect_terminal` | 新建独立窗口，返回 `connection_id` |
+| `disconnect_terminal` | 断开窗口，保留已有输出；重复调用安全 |
+| `send_and_read` | 可选输入、等待、读取输出的唯一 MCP 终端 I/O 工具 |
 | `resize_terminal` | 改变共享终端尺寸 |
-| `read_output` | 按行、字节与独立游标读取原始输出 |
+| `file_operation` | 面板原生文件管理，与 SSH SFTP 共用文件接口 |
 | `read_operation_logs` | 按独立日志游标读取操作事件 |
 
-所有参数使用严格 JSON Schema；不接受拼错的额外字段。面板 UUID 仅用于新建连接；后续必须使用返回的 `connection_id`。
+所有参数使用严格 JSON Schema，不接受未声明字段。旧 `send_input`、`send_key`、`read_output` 工具已删除，客户端需要重新发现工具。
+服务器 UUID 用于连接和文件管理；终端 I/O 必须使用 `connection_id`。
 
-## 输入与手动回车
+`list_terminals.query` 不区分大小写，匹配名称、UUID、IPv4/IPv6、系统、分组、地区。
+多个空格分隔的关键词取并集，可一次查单台或多台。空查询返回全部；每项仅含 UUID、名称和在线状态。
+需要区分同名节点时，使用列表中的唯一 UUID 调用 `get_terminal`，按需查看 IPv4/IPv6、系统、分组、地区、CPU、内存、磁盘、流量等详情。批量列表不返回这些字段。
 
-示例为 `tools/call` 的参数，`<ID>` 替换为实际窗口 ID：
+## 统一输入、等待和读取
 
-```json
-{"name":"send_input","arguments":{"connection_id":"<ID>","text":"pwd"}}
-```
-
-这一步只把 `pwd` 输入终端，不会执行。随后显式回车：
-
-```json
-{"name":"send_key","arguments":{"connection_id":"<ID>","key":"Enter"}}
-```
-
-中断前台程序：
+以下示例是 `tools/call` 的参数：
 
 ```json
-{"name":"send_key","arguments":{"connection_id":"<ID>","key":"Ctrl+C"}}
+{"name":"send_and_read","arguments":{"connection_id":"<ID>","text":"pwd\"Enter\"","wait":{"mode":"idle","idle_ms":300,"max_wait_ms":10000},"read":{"mode":"new"}}}
 ```
 
-`send_input` 内已有的换行或控制字符也会按原样发送。接口不会自动删除或追加字符。
-它没有“命令已完成”“标准错误”或“退出码”的可靠边界，Agent 应根据实际终端输出判断下一步。错误重试前先检查输出，避免重复执行已收到的输入。
+`text` 可省略或为空。默认解析双引号包裹的已知按键，例如 `pwd"Enter"`、`"Ctrl+C"`、`"Tab"`、`"Up"`。
+不自动追加回车；需要原样输入引号中的键名时设 `parse_keys=false`，再直接使用 `\r` 发送回车。
+未知键名、未闭合引号和其他字符保持原样。支持 Enter、Ctrl+A 至 Ctrl+Z、Tab、Escape、Backspace、Delete、方向键、Home/End、PageUp/PageDown、Shift+Tab。
+Shell 引号和反斜杠不会关闭按键解析，脚本、JSON 或含字面键名的命令应关闭解析。
 
-桌面终端窗口可直接输入按键，Enter 发送回车，Ctrl+C 中断，Ctrl+Shift+C 复制选中文字。窗口底部的文本框用于先编辑后发送，发送文本后仍需点击“Enter 回车”。中文输入法提交文字也可以发送。窗口显示的是文本预览；完整 ANSI 终端体验使用协助 SSH。
+`wait` 省略时等同于 `{"mode":"time","wait_ms":0,"max_wait_ms":0}`。显式传入时，各模式的字段及 `max_wait_ms` 均须提供：
 
-## 输出流与保留范围
+| `wait.mode` | 条件参数 | 返回时机 |
+| --- | --- | --- |
+| `time` | `wait_ms`、`max_wait_ms` | 指定时间到达，或达到独立最大等待 |
+| `idle` | `idle_ms`、`max_wait_ms` | 收到本次观察的新输出后，连续指定毫秒没有更多字节 |
+| `match` | `pattern`、`after_ms`、`max_wait_ms`；可选 `regex` | 新输出首次出现关键词或正则后，继续等指定毫秒 |
+
+所有时间使用毫秒，允许 0，最大 600000。`max_wait_ms=0` 对任一模式都立即刷新；静默或匹配延迟为 0 时，条件一旦满足立即返回。
+静默模式尚未收到新字节时会等到新输出或最大时限。关键词只扫描本次调用开始之后的新输出，支持跨字节分片和 UTF-8 分片；历史关键词不会误触发。
+正则匹配有独立执行超时，复杂模式超时返回 `wait_reason=pattern_timeout` 和已有输出，不会无限阻塞。
+条件扫描受每窗口最近 4 MiB 保留范围限制；过快输出被淘汰时会通过 `dropped_bytes` 报告缺失。
+
+输入发送成功之后开始计算等待时限。实际输入前就记录输出位置，因此即时回显不会漏掉。
+连接完全关闭时提前返回；`reconnecting` 不视为关闭，静默条件会暂停并在恢复后重新计时，最大等待仍生效。
+发送失败的输入不会自动重放，恢复后先刷新检查输出，避免重复执行。
+
+`read` 默认 `{"mode":"all"}`：
+
+| `read.mode` | 额外参数 | 返回范围 |
+| --- | --- | --- |
+| `all` | 无 | 当前全部保留内容，不施加旧的 64 KiB/200 行限制 |
+| `new` | 无 | 本次输入前记录的位置之后新增内容；未输入时从本次调用开始观察 |
+| `tail_bytes` | `count` | 最后 count 个原始字节 |
+| `tail_lines` | `count` | 最后 count 行，长行不额外按字节截断 |
+
+行以 LF 结束，末尾 LF 不产生虚假的空行；CR 和 ANSI 控制码保持原样。
+返回 `text`、`bytes_sent`、`bytes_returned`、`input_output_start`、`buffer_start`、`output_end`、`cursor`、`next_cursor`、`dropped_bytes`、状态与 `wait_reason`。
+位置均为绝对字节位置；这些位置用于说明范围，不是旧 `cursor` 输入参数。
+`include_base64=true` 额外返回 `data_base64`，默认省略。截取末尾字节可能切断 UTF-8 字符，精确字节应使用 Base64。
+原始 PTY 的 stdout/stderr 合并，没有可靠的退出码或命令结束边界。
+
+快速刷新末尾 100 行：
 
 ```json
-{"name":"read_output","arguments":{"connection_id":"<ID>","max_lines":100,"max_bytes":65536}}
+{"name":"send_and_read","arguments":{"connection_id":"<ID>","read":{"mode":"tail_lines","count":100}}}
 ```
 
-默认从保留输出的最前端读取，最多 200 行、65536 字节，以先到的限制为准。`max_lines=null` 可只限制字节。行以 LF 为结束符，CR 是原始终端流的一部分。
+正则匹配后延迟：
 
-后续读取把 `next_cursor` 传入 `cursor`，可加 `wait_ms`（最大 30000）等待新输出；每个读取者维护自己的游标，相互不消费数据。使用 `tail=true` 查看末尾时，不要同时传 `cursor`。
+```json
+{"name":"send_and_read","arguments":{"connection_id":"<ID>","text":"run-job\"Enter\"","wait":{"mode":"match","pattern":"(?m)^DONE [0-9]+$","regex":true,"after_ms":500,"max_wait_ms":60000},"read":{"mode":"new"}}}
+```
 
-返回的 `text` 是 UTF-8 预览；`data_base64` 保留精确原始字节。字节限制可能切在 UTF-8 字符中间，处理二进制、ANSI 或严格拼接时应解码 `data_base64` 并使用增量解码器。
+## 取消等待与并发
 
-- 每次最多读取 256 KiB；最多指定 10000 行。
-- 每次最多输入 64 KiB。
-- 每个窗口保留最近 4 MiB。`buffer_start` / `output_end` 是绝对字节位置；`dropped_bytes` 表示较早内容已淘汰。
-- 最多 32 个活动窗口，保留最近 32 个关闭窗口的记录；关闭窗口仍可读取其保留的输出。
-- “导出保留的输出”保存该窗口当前保留的原始字节，不是无限期归档。
-- 可设置无输入/输出时自动断开的分钟数，默认不自动断开。心跳和读取输出不会重置空闲时间，仍在输出的任务会继续保留。
+长等待可以提供唯一的 `wait_id`，如 `job-1`。同一客户端在另一次 `send_and_read` 中传 `cancel_wait_id=job-1`，原调用会提前返回最后输出，`wait_reason=cancelled`。
+取消等待不会中断远端前台程序；需要中断时发送 `text='"Ctrl+C"'`。等待期间不持有输入锁，允许共同输入。
+`cancel_wait_id` 只匹配同一客户端、同一 `connection_id` 的活动等待；不存在或重复 ID 会明确报错。
+
+原生 `notifications/cancelled` 也会停止后台等待。无状态 HTTP 客户端应提供稳定且唯一的 `Mcp-Client-Id` 请求头，并在取消通知中保持相同值，避免同机或同代理客户端使用相同 requestId 时相互混淆。
+同一客户端不能同时复用 requestId。没有自定义头时按来源 IP 和 User-Agent 分组。
+协议取消后，SDK 或客户端可能已关闭响应流、或只接收协议取消错误，因此最后输出不保证能随原请求送达；再次零毫秒刷新仍可读取保留内容。
+需要可靠接收最后输出时使用 `wait_id/cancel_wait_id`，保持原 HTTP 请求打开。
+
+最多同时进行 16 个有时限的等待，为刷新、中断和其他操作保留处理能力。
+每次输入最多 64 KiB；每窗口保留最近 4 MiB；最多 32 个活动窗口及最近 32 个关闭窗口。
+读取不消费数据，不会影响其他读取者，也不重置终端空闲时间。
+
+桌面协助终端支持直接键盘输入、中文输入法、Ctrl+V 粘贴和 Ctrl+Shift+C 复制。
+“新连接自动显示窗口”默认关闭，切换后立即保存。终端为独立、非置顶的无边框窗口，与主界面共用标题栏，四边四角均可缩放。
+关闭窗口只隐藏，不会断开连接；结束连接请使用 MCP 页面中的“断开选中终端”。
 
 ## 用户与 Agent 的连接详情
 
@@ -113,7 +150,12 @@ ssh -tt -p 12298 assist@127.0.0.1
 （默认 5 分钟，可在设置中调整，0 表示关闭）内退避重试，并用面板的会话标识重挂同一个终端。
 重挂不需要新的 2FA 验证码。
 
-- 界面与 `list_connections` / `get_connection` 中的状态为 `reconnecting`，列表里标黄，终端窗口标题显示“重连中”。
+- 界面与 `list_connections` / `get_connection` 中的状态为 `reconnecting`，列表里标黄，终端窗口状态栏显示“重连中”。
+- `list_connections`、`get_connection` 和 `send_and_read` 返回 `status_message="连接断开，正在自动重连..."`。
+  重连期间发送文本、按键或调整尺寸也会明确提示等待原连接恢复；应保留 `connection_id`，不要新建窗口。
+- 输入或心跳发送先发现断线时，同样启动粘性重连。失败的输入不会自动重放；连接恢复后先检查输出，避免重复执行。
+- 重挂期间过滤面板发出的完整 TEXT 提示帧 `等待被控端连接 waiting for agent...\n`，不写入 MCP 输出或转发到 SSH。
+  首次连接提示仍保留；正常 PTY 的 BINARY 输出、包含相似文字的命令输出均保留。
 - 重连成功后状态回到 `connected`，`reconnect_attempts` 记录累计尝试次数；输出游标与已保留的输出不变。
 - 超过时限、或面板已回收会话（例如远端 shell 已退出）时，窗口转为 `error` 并给出原因。
 - 主动“断开终端”会通知面板结束会话，不会进入重连。
@@ -121,6 +163,40 @@ ssh -tt -p 12298 assist@127.0.0.1
 本地 SSH 反代端口使用同一套粘性机制，时限由 `[ssh]` 节的 `ssh_sticky_minutes` 控制
 （默认 5 分钟，0 表示关闭）。重连过程会写入该服务器的日志流：掉线时记录
 “会话断开，正在重建连接”，重挂成功后记录“当前会话已重建”。
+
+## MCP 原生文件管理
+
+`file_operation` 直接调用面板文件接口，无需新建终端或模拟 Shell。
+
+| operation | 必填字段（另需 server_uuid） | 可选字段 |
+| --- | --- | --- |
+| roots | 无 | 无 |
+| list | path | offset（默认 0）、limit（默认 100，最大 1000） |
+| stat | path | 无 |
+| read | path | offset、length（默认 65536，最大 262144）、include_base64 |
+| upload | path、local_path | 无 |
+| download | path、local_path | 无 |
+| mkdir | path | mode（八进制字符串） |
+| rename | path、destination | 无 |
+| chmod | path、mode | 无 |
+| chown | path、uid/gid 至少一个 | 另一个属主字段 |
+| delete | path | recursive（默认 false） |
+
+远端路径为绝对虚拟路径：Linux 使用 `/tmp/file`，Windows 使用 `/C/path/file`。
+`local_path` 必须是运行 MCP 服务的电脑上的绝对文件路径，不是远程 MCP 客户端的路径。
+上传直接流式读取本地文件，最大 8 GiB；下载独占创建本地文件，拒绝覆盖同名本地文件。
+下载失败可能保留部分文件，请检查后自行处理。读取默认返回文本，可显式获取 Base64。
+
+```json
+{"name":"file_operation","arguments":{"server_uuid":"<UUID>","operation":"upload","local_path":"C:/files/abc.txt","path":"/tmp/abc.txt"}}
+```
+
+普通上传、创建目录和重命名先检查目标：已存在时失败并返回“存在同名文件或目录”。
+本服务会串行化同节点文件操作；面板没有原子无覆盖选项，因此与外部程序同时写同一路径仍存在竞争窗口。
+只支持面板原生能力，不提供“上传 abc 替换 def”、备份后替换、编辑后覆盖等组合流程。
+删除非空目录必须显式设 `recursive=true`；拒绝删除文件系统根目录。
+文件修改权限、属主及重命名均走原生 RPC；节点离线、权限不足或不支持时返回可读错误。
+日志记录操作类别和字节数，不写入文件内容、路径、凭据或远端异常正文。
 
 ## SFTP 文件传输
 
@@ -160,12 +236,12 @@ scp -P 12296 ./local.bin root@127.0.0.1:/tmp/remote.bin
 ```powershell
 $ErrorActionPreference = 'Stop'
 python -m pip install -r requirements.txt
-python -m unittest discover -s tests -v
 python main.py --check-mcp
+if ($LASTEXITCODE -ne 0) { throw 'Application installation check failed' }
 ```
 
-测试覆盖独立多窗口、显式回车与快捷键、字节游标、缓冲淘汰、粘性重连、SFTP 子系统、鉴权和参数错误、官方 MCP 客户端、真实本机 Paramiko 协助连接，以及 PyQt 窗口交互。远端 Komari 在测试中被模拟；实际面板的认证、2FA 和网络连通性仍需用本机配置连接验证。
+CI 执行源码编译、程序安装自检、Windows EXE 构建及打包后自检。仓库不包含独立测试脚本；实际面板的认证、2FA、文件操作和网络连通性仍需用本机配置连接验证。
 
-源码或 EXE 均支持 `--check-mcp`：验证 Qt 加载与隐藏窗口渲染，再在本机临时端口验证 MCP 依赖、鉴权和工具发现，不连接面板，不生成配置文件，成功退出码为 0。可加 `--check-mcp-report <文件路径>` 将结果写入 UTF-8 文件；Qt DLL 等依赖导入失败也会写入报告。
+源码或 EXE 均支持 `--check-mcp`：验证 Qt 加载、隐藏窗口渲染，再在本机临时端口验证 MCP 依赖、鉴权和工具发现，不连接面板，不生成配置文件，成功退出码为 0。可加 `--check-mcp-report <文件路径>` 将结果写入 UTF-8 文件；Qt DLL 等依赖导入失败也会写入报告。
 
 Windows 打包使用 `python -m PyInstaller --noconfirm KomariSSHProxy.spec`。该配置将构建进程的 DLL 搜索 PATH 限制为 Python 与 Windows 系统目录，避免其他软件的同名 ICU/CRT DLL 被误打包。Qt 自身的库和插件仍由 PyInstaller 的 Qt hook 收集。变更依赖或构建环境后，应使用新的构建目录或清理旧的构建缓存，再运行 EXE 自检。

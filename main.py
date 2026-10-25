@@ -43,7 +43,7 @@ def check_mcp_installation(report_path: str | None = None) -> int:
         from mcp_server import McpRuntime, TOOLS
         from ui import apply_style
 
-        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(["komari-installation-check"])
         apply_style(app)
         widget = QtWidgets.QWidget()
         widget.resize(32, 32)

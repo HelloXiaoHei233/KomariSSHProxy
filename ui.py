@@ -10,13 +10,15 @@ import shutil
 import tempfile
 from typing import Any, Callable
 
-from PyQt6 import QtCore, QtGui, QtSvg, QtWidgets
+from PyQt6 import QtCore, QtGui, QtWidgets
 
 from config import APP_DISPLAY_NAME, AgentConfig, CONFIG_PATH
 from komari_client import KomariClient, KomariError, normalize_latest_status
+from oauth_login import OAuthCallbackServer
+from panel_auth import PanelLoginError, checked_config, login_error_message, login_with_password
 from request_parser import apply_parsed_request, describe_parsed, parse_request_text
 from ssh_bridge import LocalSSHProxyServer, ensure_config_host_key
-from ui_controls import AppCheckBox, AppLineEdit, AppPlainTextEdit, AppSpinBox, AppTextEdit
+from ui_controls import AppCheckBox, AppLineEdit, AppPlainTextEdit, AppSpinBox, AppTextEdit, FramelessWindow, TitleBar
 
 
 LOG_VIEW_MAX_BLOCKS = 4000
@@ -75,6 +77,10 @@ def process_from_pid_file_is_running(path: Path) -> bool:
 class AppSignals(QtCore.QObject):
     login_success = QtCore.pyqtSignal(object, object)
     login_failed = QtCore.pyqtSignal(str)
+    oauth_session = QtCore.pyqtSignal(object, int)
+    oauth_failed = QtCore.pyqtSignal(str, int)
+    oauth_link_ready = QtCore.pyqtSignal(object, int)
+    oauth_link_failed = QtCore.pyqtSignal(str, int)
     clients_loaded = QtCore.pyqtSignal(object, object)
     clients_failed = QtCore.pyqtSignal(str)
     status_loaded = QtCore.pyqtSignal(object)
@@ -161,181 +167,30 @@ class ServerTableWidget(QtWidgets.QTableWidget):
         super().wheelEvent(event)
 
 
-SVG_ICONS = {
-    "system": (
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
-        '<rect x="4" y="5" width="16" height="11" rx="1.8" fill="none" '
-        'stroke="{color}" stroke-width="1.8"/>'
-        '<path d="M9 20h6M12 16v4" fill="none" stroke="{color}" '
-        'stroke-width="1.8" stroke-linecap="round"/></svg>'
-    ),
-    "dark": (
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
-        '<path d="M20 14.4A7.6 7.6 0 0 1 9.6 4a8.1 8.1 0 1 0 10.4 10.4z" '
-        'fill="none" stroke="{color}" stroke-width="1.8" stroke-linejoin="round"/></svg>'
-    ),
-    "light": (
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
-        '<circle cx="12" cy="12" r="3.5" fill="none" stroke="{color}" stroke-width="1.8"/>'
-        '<path d="M12 2.5v2.2M12 19.3v2.2M4.6 4.6l1.6 1.6M17.8 17.8l1.6 1.6'
-        'M2.5 12h2.2M19.3 12h2.2M4.6 19.4l1.6-1.6M17.8 6.2l1.6-1.6" '
-        'fill="none" stroke="{color}" stroke-width="1.8" stroke-linecap="round"/></svg>'
-    ),
-    "minimize": (
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
-        '<path d="M7 12h10" fill="none" stroke="{color}" stroke-width="1.8" '
-        'stroke-linecap="round"/></svg>'
-    ),
-    "maximize": (
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
-        '<rect x="7" y="7" width="10" height="10" rx="1" fill="none" '
-        'stroke="{color}" stroke-width="1.8"/></svg>'
-    ),
-    "restore": (
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
-        '<path d="M9 7h8v8" fill="none" stroke="{color}" stroke-width="1.8" '
-        'stroke-linejoin="round"/>'
-        '<rect x="7" y="9" width="8" height="8" rx="1" fill="none" '
-        'stroke="{color}" stroke-width="1.8"/></svg>'
-    ),
-    "close": (
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
-        '<path d="M7.5 7.5l9 9M16.5 7.5l-9 9" fill="none" stroke="{color}" '
-        'stroke-width="1.8" stroke-linecap="round"/></svg>'
-    ),
-}
-
-
-class SvgIconButton(QtWidgets.QPushButton):
-    def __init__(self, icon_name: str, *, close: bool = False):
-        super().__init__()
-        self.icon_name = icon_name
-        self.is_close_button = close
-        self.setObjectName("CloseButton" if close else "WindowButton")
-        self.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
-        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        self.setFixedSize(34, 34)
-
-    def set_icon_name(self, icon_name: str) -> None:
-        self.icon_name = icon_name
-        self.update()
-
-    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
-        painter = QtGui.QPainter(self)
-        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
-        rect = self.rect()
-        dark = self._is_dark()
-        hovered = self.underMouse()
-        down = self.isDown()
-
-        if self.is_close_button and hovered:
-            bg = QtGui.QColor("#c93f4a")
-            icon_color = "#ffffff"
-        else:
-            bg = QtGui.QColor("#2e2e2e" if dark else "#e6eeea")
-            if down:
-                bg = QtGui.QColor("#3a3a3a" if dark else "#d8e5df")
-            elif not hovered:
-                bg.setAlpha(0)
-            icon_color = "#dddddd" if dark else "#36443e"
-
-        if bg.alpha() > 0:
-            painter.setPen(QtCore.Qt.PenStyle.NoPen)
-            painter.setBrush(bg)
-            painter.drawRoundedRect(rect.adjusted(2, 2, -2, -2), 8, 8)
-
-        svg = SVG_ICONS[self.icon_name].format(color=icon_color).encode("utf-8")
-        renderer = QtSvg.QSvgRenderer(svg)
-        icon_rect = QtCore.QRectF(
-            (rect.width() - 16) / 2,
-            (rect.height() - 16) / 2,
-            16,
-            16,
-        )
-        renderer.render(painter, icon_rect)
-
-    @staticmethod
-    def _is_dark() -> bool:
-        app = QtWidgets.QApplication.instance()
-        return bool(app and app.property("effective_theme") == "dark")
-
-
-class TitleBar(QtWidgets.QFrame):
-    theme_requested = QtCore.pyqtSignal()
-
-    def __init__(self, parent: QtWidgets.QWidget | None = None):
-        super().__init__(parent)
-        self.setObjectName("TitleBar")
-        self.setFixedHeight(46)
-        self._drag_pos: QtCore.QPoint | None = None
-
-        self.title = QtWidgets.QLabel(APP_DISPLAY_NAME)
-        self.title.setObjectName("WindowTitle")
-        self.theme_btn = window_button("system")
-        self.min_btn = window_button("minimize")
-        self.max_btn = window_button("maximize")
-        self.close_btn = window_button("close", close=True)
-
-        self.theme_btn.clicked.connect(self.theme_requested.emit)
-        self.min_btn.clicked.connect(lambda: self.window().showMinimized())
-        self.max_btn.clicked.connect(self.toggle_maximized)
-        self.close_btn.clicked.connect(lambda: self.window().close())
-
-        layout = QtWidgets.QHBoxLayout(self)
-        layout.setContentsMargins(16, 0, 8, 0)
-        layout.setSpacing(8)
-        layout.addWidget(self.title)
-        layout.addStretch(1)
-        layout.addWidget(self.theme_btn)
-        layout.addWidget(self.min_btn)
-        layout.addWidget(self.max_btn)
-        layout.addWidget(self.close_btn)
-
-    def set_theme_mode(self, mode: str) -> None:
-        labels = {"system": "跟随系统", "dark": "暗色模式", "light": "亮色模式"}
-        icons = {"system": "system", "dark": "dark", "light": "light"}
-        self.theme_btn.set_icon_name(icons.get(mode, "system"))
-        self.theme_btn.setToolTip(labels.get(mode, "跟随系统"))
-
-    def toggle_maximized(self) -> None:
-        window = self.window()
-        if window.isMaximized():
-            window.showNormal()
-            self.max_btn.set_icon_name("maximize")
-        else:
-            window.showMaximized()
-            self.max_btn.set_icon_name("restore")
-
-    def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:
-        if event.button() == QtCore.Qt.MouseButton.LeftButton:
-            self.toggle_maximized()
-            event.accept()
-
-    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
-        if event.button() == QtCore.Qt.MouseButton.LeftButton and not self.window().isMaximized():
-            self._drag_pos = event.globalPosition().toPoint() - self.window().frameGeometry().topLeft()
-            event.accept()
-
-    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
-        if self._drag_pos is not None and event.buttons() & QtCore.Qt.MouseButton.LeftButton:
-            self.window().move(event.globalPosition().toPoint() - self._drag_pos)
-            event.accept()
-
-    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
-        self._drag_pos = None
-        event.accept()
-
-
 class CredentialsPage(QtWidgets.QWidget):
     save_requested = QtCore.pyqtSignal(object)
+    password_requested = QtCore.pyqtSignal(object, str, str, str)
+    oauth_requested = QtCore.pyqtSignal(object)
+    oauth_prepare_requested = QtCore.pyqtSignal(object)
+    oauth_copy_requested = QtCore.pyqtSignal()
+    oauth_callback_requested = QtCore.pyqtSignal(str)
+    auth_changed = QtCore.pyqtSignal()
     back_requested = QtCore.pyqtSignal()
 
     def __init__(self, config: AgentConfig):
         super().__init__()
         self.current_config = config
+        self._busy = False
+        self._oauth_available = False
         self.base_url = line_edit(config.base_url)
         self.user_agent = line_edit(config.user_agent)
         self.session_token = line_edit(config.session_token)
+        self.login_username = line_edit("")
+        self.login_password = line_edit("")
+        self.login_password.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        self.login_2fa = line_edit("")
+        self.login_2fa.setPlaceholderText("已启用 2FA 时填写当前验证码")
+        self.login_2fa.setMaxLength(32)
         self.cf_clearance = line_edit(config.cf_clearance)
         self.language = line_edit(config.language)
         self.sensorsdata = text_edit(config.sensorsdata2015jssdkcross, 86)
@@ -357,9 +212,10 @@ class CredentialsPage(QtWidgets.QWidget):
         title = QtWidgets.QLabel("登录凭据")
         title.setObjectName("HeroTitle")
         subtitle = QtWidgets.QLabel(
-            f"首次启动需要填写面板会话凭据，保存后会写入程序同目录的 {CONFIG_PATH.name}。"
+            f"支持账号密码、OAuth 和 Cookie 登录。验证成功后，会话保存到 {CONFIG_PATH.name}；密码与验证码不保存。"
         )
         subtitle.setObjectName("Muted")
+        subtitle.setWordWrap(True)
 
         form = QtWidgets.QFormLayout()
         form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
@@ -368,11 +224,56 @@ class CredentialsPage(QtWidgets.QWidget):
         form.setVerticalSpacing(12)
         form.addRow("面板地址", self.base_url)
         form.addRow("User-Agent", self.user_agent)
-        form.addRow("session_token", self.session_token)
-        form.addRow("cf_clearance", self.cf_clearance)
-        form.addRow("language", self.language)
-        form.addRow("sensorsdata2015jssdkcross", self.sensorsdata)
-        form.addRow("额外 Cookie", self.extra_cookies)
+
+        self.login_tabs = QtWidgets.QTabWidget()
+        password_page = QtWidgets.QWidget()
+        password_form = QtWidgets.QFormLayout(password_page)
+        password_form.addRow("账号", self.login_username)
+        password_form.addRow("密码", self.login_password)
+        password_form.addRow("2FA 验证码", self.login_2fa)
+        self.login_tabs.addTab(password_page, "账号密码")
+        oauth_page = QtWidgets.QWidget()
+        oauth_layout = QtWidgets.QVBoxLayout(oauth_page)
+        oauth_hint = QtWidgets.QLabel(
+            "软件自动解析面板 OAuth 跳转，直接打开服务商授权页。也可生成链接，复制到其他浏览器。\n"
+            "授权后将地址栏中的完整面板回调链接粘贴到下方；显示 Invalid state 时仍可继续。"
+        )
+        oauth_hint.setWordWrap(True)
+        oauth_layout.addWidget(oauth_hint)
+        self.oauth_link = line_edit("")
+        self.oauth_link.setReadOnly(True)
+        self.oauth_link.setPlaceholderText("点击生成链接或直接打开 OAuth 授权")
+        self.oauth_refresh_btn = soft_button("生成 / 刷新授权链接")
+        self.oauth_refresh_btn.clicked.connect(lambda: self.oauth_prepare_requested.emit(self.to_config()))
+        self.oauth_copy_btn = soft_button("复制授权链接")
+        self.oauth_copy_btn.clicked.connect(self.oauth_copy_requested.emit)
+        callback_row = QtWidgets.QHBoxLayout()
+        callback_row.addWidget(self.oauth_link, 1)
+        callback_row.addWidget(self.oauth_refresh_btn)
+        callback_row.addWidget(self.oauth_copy_btn)
+        oauth_layout.addLayout(callback_row)
+        self.oauth_status = QtWidgets.QLabel("")
+        self.oauth_status.setWordWrap(True)
+        oauth_layout.addWidget(self.oauth_status)
+        self.oauth_result = line_edit("")
+        self.oauth_result.setPlaceholderText("粘贴授权后 /api/oauth_callback?code=... 的完整链接")
+        self.oauth_result.setMaxLength(16384)
+        self.oauth_submit_btn = soft_button("提交回调链接")
+        self.oauth_submit_btn.clicked.connect(lambda: self.oauth_callback_requested.emit(self.oauth_result.text()))
+        result_row = QtWidgets.QHBoxLayout()
+        result_row.addWidget(self.oauth_result, 1)
+        result_row.addWidget(self.oauth_submit_btn)
+        oauth_layout.addLayout(result_row)
+        oauth_layout.addStretch(1)
+        self.login_tabs.addTab(oauth_page, "OAuth")
+        cookie_page = QtWidgets.QWidget()
+        cookie_layout = QtWidgets.QVBoxLayout(cookie_page)
+        cookie_form = QtWidgets.QFormLayout()
+        cookie_form.addRow("session_token", self.session_token)
+        cookie_form.addRow("cf_clearance", self.cf_clearance)
+        cookie_form.addRow("language", self.language)
+        cookie_form.addRow("sensorsdata2015jssdkcross", self.sensorsdata)
+        cookie_form.addRow("额外 Cookie", self.extra_cookies)
 
         parser_card = QtWidgets.QWidget()
         parser_layout = QtWidgets.QVBoxLayout(parser_card)
@@ -398,6 +299,11 @@ class CredentialsPage(QtWidgets.QWidget):
         parser_layout.addWidget(parser_hint)
         parser_layout.addWidget(self.request_input)
         parser_layout.addLayout(parser_actions)
+        cookie_layout.addWidget(parser_card)
+        cookie_layout.addLayout(cookie_form)
+        self.login_tabs.addTab(cookie_page, "Cookie")
+        self.login_tabs.setCurrentIndex(2 if config.session_token else 0)
+        self.login_tabs.currentChanged.connect(self._login_mode_changed)
 
         card = card_frame()
         card_layout = QtWidgets.QVBoxLayout(card)
@@ -410,8 +316,8 @@ class CredentialsPage(QtWidgets.QWidget):
         card_layout.addLayout(title_row)
         card_layout.addWidget(subtitle)
         card_layout.addSpacing(6)
-        card_layout.addWidget(parser_card)
         card_layout.addLayout(form)
+        card_layout.addWidget(self.login_tabs)
         card_layout.addSpacing(8)
         actions = QtWidgets.QHBoxLayout()
         actions.addWidget(self.status, 1)
@@ -435,11 +341,43 @@ class CredentialsPage(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(scroll)
+        self._login_mode_changed(self.login_tabs.currentIndex())
+        for widget in (self.base_url, self.user_agent, self.session_token, self.cf_clearance, self.language):
+            widget.textChanged.connect(self.auth_changed.emit)
+        for widget in (self.sensorsdata, self.extra_cookies):
+            widget.textChanged.connect(self.auth_changed.emit)
+
+    def _login_mode_changed(self, index: int) -> None:
+        # The long Cookie form must not push the password/OAuth actions off screen.
+        page = self.login_tabs.widget(index)
+        page.ensurePolished()
+        page.layout().invalidate()
+        width = max(1, self.login_tabs.contentsRect().width() - 4)
+        page_height = max(page.minimumSizeHint().height(), page.layout().totalHeightForWidth(width),
+                          page.sizeHint().height())
+        height = page_height + self.login_tabs.tabBar().sizeHint().height() + 8
+        self.login_tabs.setFixedHeight(height)
+        self.set_busy(self._busy, self.status.text())
 
     def set_busy(self, busy: bool, message: str = "") -> None:
-        self.save_btn.setDisabled(busy)
-        self.save_btn.setText("登录中..." if busy else "保存并登录")
+        self._busy = busy
+        for widget in (self.save_btn, self.login_tabs, self.base_url, self.user_agent, self.back_btn):
+            widget.setDisabled(busy)
+        oauth = self.login_tabs.currentIndex() == 1
+        label = "用默认浏览器打开 OAuth 授权" if oauth else "登录并保存会话"
+        self.save_btn.setText("登录中..." if busy else label)
+        if oauth and not self._oauth_available:
+            self.save_btn.setDisabled(True)
+        self.oauth_refresh_btn.setEnabled(self._oauth_available and not busy)
+        self.oauth_copy_btn.setEnabled(bool(self.oauth_link.text()) and not busy)
+        self.oauth_submit_btn.setEnabled(bool(self.oauth_link.text()) and not busy)
         self.status.setText(message)
+
+    def set_oauth_authorization(self, url: str, message: str, available: bool) -> None:
+        self._oauth_available = available
+        self.oauth_link.setText(url)
+        self.oauth_status.setText(message)
+        self._login_mode_changed(self.login_tabs.currentIndex())
 
     def set_can_go_back(self, enabled: bool) -> None:
         self.back_btn.setVisible(enabled)
@@ -457,10 +395,17 @@ class CredentialsPage(QtWidgets.QWidget):
 
     def _save(self) -> None:
         cfg = self.to_config()
-        self.save_requested.emit(cfg)
+        mode = self.login_tabs.currentIndex()
+        if mode == 0:
+            self.password_requested.emit(cfg, self.login_username.text(),
+                                         self.login_password.text(), self.login_2fa.text())
+        elif mode == 1:
+            self.oauth_requested.emit(cfg)
+        else:
+            self.save_requested.emit(cfg)
 
     def to_config(self) -> AgentConfig:
-        cfg = self.current_config
+        cfg = replace(self.current_config)
         cfg.base_url = self.base_url.text().strip()
         cfg.user_agent = self.user_agent.text().strip()
         cfg.session_token = self.session_token.text().strip()
@@ -479,6 +424,12 @@ class CredentialsPage(QtWidgets.QWidget):
         self.language.setText(config.language)
         self.sensorsdata.setPlainText(config.sensorsdata2015jssdkcross)
         self.extra_cookies.setPlainText(config.extra_cookies)
+
+    def clear_login_secrets(self) -> None:
+        self.login_password.clear()
+        self.login_2fa.clear()
+        self.request_input.clear()
+        self.oauth_result.clear()
 
 
 class ServerListPage(QtWidgets.QWidget):
@@ -979,8 +930,6 @@ class PortConflictDialog(QtWidgets.QDialog):
     def __init__(self, server_name: str, port: int, parent: QtWidgets.QWidget | None = None):
         super().__init__(parent)
         self.setModal(True)
-        self.setWindowFlag(QtCore.Qt.WindowType.FramelessWindowHint, True)
-        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setMinimumWidth(460)
 
         card = card_frame()
@@ -1021,8 +970,6 @@ class RunningProxiesDialog(QtWidgets.QDialog):
     def __init__(self, summaries: dict[str, dict[str, Any]], parent: QtWidgets.QWidget | None = None):
         super().__init__(parent)
         self.setModal(True)
-        self.setWindowFlag(QtCore.Qt.WindowType.FramelessWindowHint, True)
-        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setMinimumWidth(560)
 
         card = card_frame()
@@ -1071,15 +1018,21 @@ class RunningProxiesDialog(QtWidgets.QDialog):
         self.accept()
 
 
-class MainWindow(QtWidgets.QMainWindow):
+class MainWindow(FramelessWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_DISPLAY_NAME)
-        self.setWindowFlag(QtCore.Qt.WindowType.FramelessWindowHint, True)
-        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setMinimumSize(980, 640)
         self.resize(1180, 760)
         self.signals = AppSignals()
+        self._closed = False
+        self._login_busy = False
+        self._authenticated = False
+        self._checking_history = False
+        self._oauth_submission_generation: int | None = None
+        self._oauth_request_id = 0
+        self._oauth_starting: int | None = None
+        self.oauth_callback = OAuthCallbackServer(self.signals.oauth_session.emit)
         config_exists = CONFIG_PATH.exists()
         self.config = AgentConfig.load() if config_exists else AgentConfig()
         self.ensure_local_config()
@@ -1114,13 +1067,6 @@ class MainWindow(QtWidgets.QMainWindow):
         shell_layout.setSpacing(0)
         shell_layout.addWidget(self.title_bar)
         shell_layout.addWidget(self.stack, 1)
-        grip_row = QtWidgets.QHBoxLayout()
-        grip_row.setContentsMargins(0, 0, 8, 8)
-        grip_row.addStretch(1)
-        grip = QtWidgets.QSizeGrip(shell)
-        grip.setFixedSize(18, 18)
-        grip_row.addWidget(grip)
-        shell_layout.addLayout(grip_row)
 
         root = QtWidgets.QWidget()
         root.setObjectName("Root")
@@ -1137,14 +1083,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log_flush_timer = QtCore.QTimer(self)
         self.log_flush_timer.setInterval(100)
         self.log_flush_timer.timeout.connect(self.flush_visible_logs)
+        self.oauth_timer = QtCore.QTimer(self)
+        self.oauth_timer.setInterval(1000)
+        self.oauth_timer.timeout.connect(self.refresh_oauth_link)
+        self.oauth_timer.start()
 
         self._wire()
         if config_exists and self.config.has_login_credentials():
+            self._checking_history = True
             self.stack.setCurrentWidget(self.server_page)
             self.server_page.set_loading(f"检测到 {CONFIG_PATH.name}，正在自动登录...")
+            self._sync_oauth_callback()
             self.try_login(self.config, save=False)
         else:
             self.stack.setCurrentWidget(self.credentials_page)
+            self._sync_oauth_callback()
 
     def ensure_local_config(self) -> None:
         try:
@@ -1156,6 +1109,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _wire(self) -> None:
         self.credentials_page.save_requested.connect(lambda cfg: self.try_login(cfg, save=True))
+        self.credentials_page.password_requested.connect(
+            lambda cfg, username, password, code: self.try_login(
+                cfg, save=True, credentials=(username, password, code)))
+        self.credentials_page.oauth_requested.connect(self.start_oauth_login)
+        self.credentials_page.oauth_prepare_requested.connect(
+            lambda config: self.start_oauth_login(config, open_browser=False, refresh=True))
+        self.credentials_page.oauth_copy_requested.connect(self.copy_oauth_link)
+        self.credentials_page.oauth_callback_requested.connect(self.submit_oauth_callback)
+        self.credentials_page.auth_changed.connect(self._sync_oauth_callback)
         self.credentials_page.back_requested.connect(self.back_to_servers_from_credentials)
         self.server_page.refresh_requested.connect(self.refresh_clients)
         self.server_page.edit_credentials_requested.connect(self.show_credentials)
@@ -1176,6 +1138,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.signals.login_success.connect(self.on_login_success)
         self.signals.login_failed.connect(self.on_login_failed)
+        self.signals.oauth_session.connect(self.on_oauth_session)
+        self.signals.oauth_failed.connect(self.on_oauth_failed)
+        self.signals.oauth_link_ready.connect(self.on_oauth_link_ready)
+        self.signals.oauth_link_failed.connect(self.on_oauth_link_failed)
         self.signals.clients_loaded.connect(self.on_clients_loaded)
         self.signals.clients_failed.connect(self.server_page.show_error)
         self.signals.status_loaded.connect(self.on_status_loaded)
@@ -1200,39 +1166,217 @@ class MainWindow(QtWidgets.QMainWindow):
         if persist:
             self.config.save()
 
-    def try_login(self, config: AgentConfig, save: bool) -> None:
+    def start_oauth_login(self, config: AgentConfig, *, open_browser: bool = True,
+                          refresh: bool = False) -> None:
+        if (self._closed or self._login_busy or self._authenticated or self._checking_history
+                or self._oauth_starting is not None or self._oauth_submission_generation is not None):
+            return
+        try:
+            checked_config(config)
+            self._sync_oauth_callback()
+            if not self.oauth_callback.url:
+                raise PanelLoginError("本机回调监听未启动，请检查登录状态。")
+            url, _ = self.oauth_callback.authorization
+            if url and not refresh:
+                if open_browser:
+                    self.open_oauth_url(url)
+                return
+        except Exception as exc:
+            self.credentials_page.status.setText(login_error_message(exc))
+            return
+        self._oauth_request_id += 1
+        request_id = self._oauth_request_id
+        self._oauth_starting = request_id
+        generation = self.oauth_callback.generation
+        self.credentials_page.oauth_result.clear()
+        self.credentials_page.set_oauth_authorization("", "正在解析面板的 OAuth 授权跳转...", True)
+        self.credentials_page.set_busy(True, "正在获取授权链接...")
+
+        def task() -> None:
+            try:
+                url = self.oauth_callback.begin()
+                if not self._closed:
+                    self.signals.oauth_link_ready.emit(
+                        {"url": url, "generation": generation, "open_browser": open_browser}, request_id)
+            except Exception as exc:
+                if not self._closed:
+                    self.signals.oauth_link_failed.emit(login_error_message(exc), request_id)
+
+        threading.Thread(target=task, name="oauth-authorize", daemon=True).start()
+
+    def on_oauth_link_ready(self, result: dict, request_id: int) -> None:
+        if request_id != self._oauth_starting:
+            return
+        self._oauth_starting = None
+        if self._closed or self._login_busy or self._authenticated or self._checking_history:
+            return
+        self.credentials_page.set_busy(False)
+        self._sync_oauth_callback()
+        if (result["generation"] != self.oauth_callback.generation
+                or result["url"] != self.oauth_callback.authorization[0]):
+            return
+        if result["open_browser"]:
+            self.open_oauth_url(result["url"])
+
+    def on_oauth_link_failed(self, message: str, request_id: int) -> None:
+        if request_id != self._oauth_starting:
+            return
+        self._oauth_starting = None
+        if self._closed or self._login_busy or self._authenticated or self._checking_history:
+            return
+        self.credentials_page.set_busy(False, message)
+        self._sync_oauth_callback()
+
+    def open_oauth_url(self, url: str) -> None:
+        if not QtGui.QDesktopServices.openUrl(QtCore.QUrl(url)):
+            self.credentials_page.status.setText("无法打开默认浏览器，请复制授权链接到浏览器中打开。")
+
+    def copy_oauth_link(self) -> None:
+        url, _ = self.oauth_callback.authorization
+        if not url or url != self.credentials_page.oauth_link.text():
+            self._sync_oauth_callback()
+            self.credentials_page.status.setText("授权链接已失效，请重新生成。")
+            return
+        QtWidgets.QApplication.clipboard().setText(url)
+
+    def refresh_oauth_link(self) -> None:
+        if (self._closed or self._login_busy or self._authenticated or self._checking_history
+                or self._oauth_starting is not None or self._oauth_submission_generation is not None):
+            return
+        if self.credentials_page.oauth_link.text() != self.oauth_callback.authorization[0]:
+            self._sync_oauth_callback()
+
+    def _sync_oauth_callback(self) -> None:
+        if self._closed or self._authenticated or self._checking_history:
+            if self.oauth_callback.url:
+                self.oauth_callback.stop()
+            message = "正在验证历史 Cookie，回调监听已关闭。" if self._checking_history else "已登录，回调监听已关闭。"
+            self.credentials_page.set_oauth_authorization("", message, False)
+            return
+        try:
+            generation = self.oauth_callback.generation
+            self.oauth_callback.configure(self.credentials_page.to_config())
+            self.oauth_callback.start()
+            if generation != self.oauth_callback.generation:
+                self.credentials_page.oauth_result.clear()
+            url, provider = self.oauth_callback.authorization
+            providers = {"github": "GitHub", "generic": "通用 OAuth / OIDC", "qq": "QQ 聚合登录"}
+            message = (f"已解析 {providers.get(provider, 'OAuth')} 授权链接，五分钟内有效。授权后粘贴完整面板回调链接。"
+                       if url else "本机回调监听已开启。点击生成授权链接，或用默认浏览器直接开始授权。")
+            self.credentials_page.set_oauth_authorization(url, message, True)
+        except OSError:
+            self.credentials_page.set_oauth_authorization("", "无法启动本机回调监听，请检查本机网络或稍后重试。", False)
+
+    def submit_oauth_callback(self, callback_url: str) -> None:
+        if (self._closed or self._login_busy or self._oauth_starting is not None
+                or self._oauth_submission_generation is not None
+                or self._authenticated):
+            return
+        self.credentials_page.set_busy(True, "正在转发授权回调...")
+        generation = self.oauth_callback.generation
+        self._oauth_submission_generation = generation
+
+        def task() -> None:
+            try:
+                self.oauth_callback.submit(callback_url)
+            except Exception as exc:
+                if not self._closed:
+                    self.signals.oauth_failed.emit(login_error_message(exc), generation)
+
+        threading.Thread(target=task, name="oauth-exchange", daemon=True).start()
+
+    def on_oauth_session(self, config: AgentConfig, generation: int) -> None:
+        if (self._closed or self._authenticated or self._checking_history or self._login_busy
+                or generation != self.oauth_callback.generation):
+            return
+        self._oauth_submission_generation = None
+        self.credentials_page.oauth_result.clear()
+        self.try_login(config, save=True)
+
+    def on_oauth_failed(self, message: str, generation: int) -> None:
+        if generation != self._oauth_submission_generation:
+            return
+        self._oauth_submission_generation = None
+        if self._closed or self._authenticated or self._login_busy:
+            return
+        if generation != self.oauth_callback.generation:
+            self.credentials_page.set_busy(False)
+            self._sync_oauth_callback()
+            return
+        self.credentials_page.set_busy(False, message)
+        self._sync_oauth_callback()
+
+    def try_login(self, config: AgentConfig, save: bool, *,
+                  credentials: tuple[str, str, str] | None = None) -> None:
+        if self._closed or self._login_busy:
+            return
+        self._oauth_starting = None
+        self._oauth_submission_generation = None
+        self._login_busy = True
+        self.oauth_callback.set_busy(True)
         self.credentials_page.set_busy(True, "正在登录...")
         self.server_page.set_loading("正在登录并获取服务器列表...")
 
         def task() -> None:
+            client = None
             try:
-                if save:
-                    config.save()
-                client = KomariClient(config)
+                candidate = checked_config(config)
+                if credentials is not None:
+                    candidate = login_with_password(candidate, *credentials)
+                client = KomariClient(candidate)
+                if client.get_me().get("logged_in") is not True:
+                    raise PanelLoginError("面板尚未确认登录会话，请重新登录。")
                 clients = client.validate()
                 try:
                     status = normalize_latest_status(client.get_latest_status())
                 except Exception:
                     status = {}
-                self.signals.login_success.emit(config, {"clients": clients, "status": status})
+                if not self._closed:
+                    self.signals.login_success.emit(candidate, {"clients": clients, "status": status, "save": save})
             except Exception as exc:
-                self.signals.login_failed.emit(str(exc))
+                if not self._closed:
+                    self.signals.login_failed.emit(login_error_message(exc))
+            finally:
+                if client is not None:
+                    client.session.close()
 
         threading.Thread(target=task, daemon=True).start()
 
     def on_login_success(self, config: AgentConfig, payload: dict[str, Any]) -> None:
+        if self._closed:
+            return
+        config.mcp_auto_open = self.config.mcp_auto_open
+        if payload.get("save"):
+            try:
+                config.save()
+            except OSError:
+                self.on_login_failed("面板验证成功，但无法保存配置文件，请检查程序目录的写入权限。")
+                return
+        self._login_busy = False
+        self._checking_history = False
+        self._authenticated = True
+        self.oauth_callback.stop()
         self.config = config
         self.mcp_runtime.update_config(config)
         self.mcp_page.load_config(config)
         self.set_theme_mode(self.config.app_theme, persist=False)
         self.credentials_page.set_busy(False, "登录成功")
+        self.credentials_page.load_config(config)
+        self.credentials_page.clear_login_secrets()
+        self._sync_oauth_callback()
         self.stack.setCurrentWidget(self.server_page)
         self.on_clients_loaded(payload["clients"], payload["status"])
 
     def on_login_failed(self, message: str) -> None:
+        if self._closed:
+            return
+        self._login_busy = False
+        self._checking_history = False
+        self.oauth_callback.set_busy(False)
         self.credentials_page.set_busy(False, f"登录失败: {message}")
         self.server_page.show_error(f"登录失败: {message}")
         self.stack.setCurrentWidget(self.credentials_page)
+        self._sync_oauth_callback()
 
     def refresh_clients(self) -> None:
         self.server_page.set_loading("正在刷新服务器列表...")
@@ -1272,11 +1416,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def show_credentials(self) -> None:
         self.save_current_proxy_draft()
         self.credentials_page.load_config(self.config)
-        self.credentials_page.set_can_go_back(bool(self.server_page.clients))
+        self.credentials_page.set_can_go_back(self._authenticated)
         self.stack.setCurrentWidget(self.credentials_page)
 
     def back_to_servers_from_credentials(self) -> None:
-        if self.server_page.clients:
+        if self._authenticated:
             self.stack.setCurrentWidget(self.server_page)
 
     def open_proxy_page(self, client: dict[str, Any]) -> None:
@@ -1570,6 +1714,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.update_all_proxy_indicators()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self._closed = True
+        self.oauth_timer.stop()
+        self.oauth_callback.stop()
+        self.credentials_page.clear_login_secrets()
         self.status_timer.stop()
         self.log_flush_timer.stop()
         self.mcp_page.shutdown()
@@ -2043,10 +2191,6 @@ def warn_button(text: str) -> QtWidgets.QPushButton:
 
 def soft_button(text: str) -> QtWidgets.QPushButton:
     return QtWidgets.QPushButton(text)
-
-
-def window_button(icon_name: str = "system", close: bool = False) -> SvgIconButton:
-    return SvgIconButton(icon_name, close=close)
 
 
 def metric_bar() -> QtWidgets.QProgressBar:
