@@ -127,10 +127,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           @'
-          登录方式支持账号密码和OAuth登录
-          为MCP支持了文件操作
-          优化了MCP操作流程
-          修复边框大小无法拖拽的问题
+          修复新版Komari登录异常问题
           '@ | Set-Content -LiteralPath release-description.txt -Encoding UTF8
 
       - name: Create release and upload executable
