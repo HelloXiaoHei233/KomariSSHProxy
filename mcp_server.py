@@ -411,7 +411,7 @@ class MCPHttpServer:
             if event is not None:
                 event.set()
 
-        server = Server("komari-terminal", version="1.2.0", instructions=INSTRUCTIONS,
+        server = Server("komari-terminal", version="1.2.1", instructions=INSTRUCTIONS,
                         on_list_tools=list_tools, on_call_tool=call_tool)
         server.add_notification_handler("notifications/cancelled", types.CancelledNotificationParams, cancel_tool)
         # HttpGuard validates both Host and Origin, including configured reverse-proxy domains.

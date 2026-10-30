@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 import requests
 
 from config import AgentConfig, normalize_base_url
-from komari_client import KomariClient, KomariError
+from komari_client import KomariClient, KomariError, KomariResponseError
 
 
 class PanelLoginError(KomariError):
@@ -74,7 +74,7 @@ def response_cookie(response: requests.Response, name: str, config: AgentConfig)
 
 
 def login_error_message(exc: Exception) -> str:
-    if isinstance(exc, PanelLoginError):
+    if isinstance(exc, (PanelLoginError, KomariResponseError)):
         return str(exc)
     if isinstance(exc, requests.exceptions.SSLError):
         return "无法验证面板的 TLS 证书，请检查证书配置。"

@@ -20,6 +20,16 @@ class KomariError(RuntimeError):
     pass
 
 
+class KomariResponseError(KomariError):
+    """Safe response diagnostics: never include response bodies or URL queries."""
+
+    def __init__(self, path: str, status_code: int, content_type: str):
+        self.status_code = status_code
+        endpoint = urlparse(path).path
+        kind = "HTML 页面" if content_type.split(";", 1)[0].strip().lower() == "text/html" else "非 JSON 响应"
+        super().__init__(f"面板接口 {endpoint} 返回了{kind}（HTTP {status_code}）；请检查面板版本或站点访问限制。")
+
+
 class KomariClient:
     def __init__(self, config: AgentConfig):
         self.config = config
@@ -45,7 +55,7 @@ class KomariClient:
             json=json_body,
             timeout=timeout,
         )
-        payload = self._read_json(response)
+        payload = self._read_json(response, path=path)
         if not response.ok:
             message = _message_from_payload(payload) or f"HTTP {response.status_code}"
             raise KomariError(message)
@@ -84,10 +94,19 @@ class KomariClient:
         )
 
     def validate(self) -> list[dict[str, Any]]:
-        self.get_xterm_settings()
+        # Komari 1.5.0–1.5.1 exposed /api/admin/settings/xtermjs. It was
+        # removed in 1.6.0 (upstream commit 68c284d); 1.6.x returns SPA HTML
+        # for that missing GET route. Terminal preferences are not auth checks.
+        # /api/admin/client/list is protected and present in 1.5.0–1.6.1;
+        # use it directly on both versions, retaining the administrator check.
         return self.get_clients()
 
     def get_xterm_settings(self) -> dict[str, Any]:
+        """Legacy optional API, verified on Komari 1.5.0–1.5.1, removed in 1.6.0.
+
+        Kept for callers targeting old panels; never required for login.
+        New panels use frontend defaults and do not expose a replacement API.
+        """
         payload = self.request(
             "GET",
             "/api/admin/settings/xtermjs",
@@ -184,14 +203,14 @@ class KomariClient:
         return headers
 
     @staticmethod
-    def _read_json(response: requests.Response) -> Any:
+    def _read_json(response: requests.Response, *, path: str = "") -> Any:
         if not response.content:
             return None
         try:
             return response.json()
         except json.JSONDecodeError as exc:
-            text = response.text[:300].replace("\n", " ")
-            raise KomariError(f"响应不是 JSON: {text}") from exc
+            raise KomariResponseError(path, response.status_code,
+                                      response.headers.get("Content-Type", "")) from exc
 
 
 def normalize_latest_status(raw: dict[str, Any]) -> dict[str, dict[str, Any]]:
